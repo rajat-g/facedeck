@@ -9,3 +9,4 @@ face_groups.txt
 processing_state.db
 processing_state.json
 results.txt
+.cursor/
