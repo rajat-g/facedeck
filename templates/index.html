@@ -8,51 +8,64 @@
 </head>
 <body>
     <header>
-        <h1>InsightFace Photo Grouping</h1>
-        <p>Detect faces in a folder of photos and group them by person.</p>
+        <div class="header-title">
+            <h1>Face Grouping</h1>
+            <span class="header-sub">InsightFace</span>
+        </div>
         <button id="theme-btn" title="Toggle dark/light theme">&#9789;</button>
     </header>
 
     <main>
-        <section id="config-panel" class="card">
-            <h2>Configuration</h2>
-            <div class="form-row">
-                <label for="input-folders">Input folders (one per line)</label>
-                <div class="input-with-btn">
-                    <textarea id="input-folders" rows="2" placeholder="C:\path\to\photos&#10;C:\other\photos"></textarea>
-                    <button type="button" id="browse-folder-btn">Add...</button>
-                </div>
+        <section id="config-panel" class="card collapsed">
+            <div id="config-toggle" class="card-header" title="Click to expand/collapse">
+                <h2>Configuration</h2>
+                <span id="config-summary" class="muted"></span>
+                <button id="config-collapse-btn" class="icon-btn" aria-label="Toggle configuration">&#9662;</button>
             </div>
-            <div class="form-row-grid">
+            <div id="config-body">
                 <div class="form-row">
-                    <label for="output-faces">Output faces folder</label>
-                    <input type="text" id="output-faces" value="output_faces">
-                </div>
-                <div class="form-row">
-                    <label for="db-file">Database file</label>
+                    <label for="input-folders">Input folders (one per line)</label>
                     <div class="input-with-btn">
-                        <input type="text" id="db-file" value="processing_state.db">
-                        <button type="button" id="browse-db-btn">Browse...</button>
+                        <textarea id="input-folders" rows="2" placeholder="C:\path\to\photos&#10;C:\other\photos"></textarea>
+                        <button type="button" id="browse-folder-btn">Add...</button>
                     </div>
                 </div>
-            </div>
-            <div class="form-row-grid">
-                <div class="form-row">
-                    <label for="output-file">Report file</label>
-                    <input type="text" id="output-file" value="face_groups.txt">
+                <div class="form-row-grid">
+                    <div class="form-row">
+                        <label for="output-faces">Output faces folder</label>
+                        <input type="text" id="output-faces" value="output_faces">
+                    </div>
+                    <div class="form-row">
+                        <label for="db-file">Database file</label>
+                        <div class="input-with-btn">
+                            <input type="text" id="db-file" value="processing_state.db">
+                            <button type="button" id="browse-db-btn">Browse...</button>
+                        </div>
+                    </div>
                 </div>
-                <div class="form-row">
-                    <label for="threshold">Similarity threshold: <span id="threshold-value">0.60</span></label>
-                    <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
+                <div class="form-row-grid">
+                    <div class="form-row">
+                        <label for="output-file">Report file</label>
+                        <input type="text" id="output-file" value="face_groups.txt">
+                    </div>
+                    <div class="form-row">
+                        <label for="threshold">Similarity threshold: <span id="threshold-value">0.60</span></label>
+                        <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
+                    </div>
                 </div>
-            </div>
-            <div class="actions">
-                <button id="run-btn" class="primary">Start grouping</button>
-                <button id="cancel-btn" class="danger hidden">Cancel run</button>
-                <button id="refresh-btn">Refresh groups</button>
-                <button id="undo-btn" title="Undo last move or delete">Undo</button>
-                <button id="export-csv-btn">Export CSV</button>
-                <button id="export-json-btn">Export JSON</button>
+                <div class="actions">
+                    <button id="run-btn" class="primary">Start grouping</button>
+                    <button id="cancel-btn" class="danger hidden">Cancel run</button>
+                    <button id="refresh-btn">Refresh</button>
+                    <button id="undo-btn" title="Undo last move or delete">Undo</button>
+                    <details class="menu">
+                        <summary>Export &#9662;</summary>
+                        <div class="menu-items">
+                            <button id="export-csv-btn">Export CSV</button>
+                            <button id="export-json-btn">Export JSON</button>
+                        </div>
+                    </details>
+                </div>
             </div>
         </section>
 
@@ -66,10 +79,8 @@
             <div id="error-box" class="error-box hidden"></div>
         </section>
 
-        <section id="stats-panel" class="card hidden">
-            <h2>Stats</h2>
+        <section id="stats-panel" class="card compact hidden">
             <div id="stats-summary" class="stats-chips"></div>
-            <ol id="stats-largest"></ol>
         </section>
 
         <section id="groups-panel">
@@ -78,7 +89,7 @@
                 <div class="filters">
                     <input type="search" id="filter-text" placeholder="Filter by name or source photo...">
                     <label class="min-faces">Min faces
-                        <input type="number" id="filter-min-faces" min="0" value="0" style="width:60px">
+                        <input type="number" id="filter-min-faces" min="0" value="0">
                     </label>
                     <label class="min-faces">Sort
                         <select id="sort-by">
@@ -91,16 +102,6 @@
                     </label>
                 </div>
             </div>
-            <div id="bulk-bar" class="hidden">
-                <span id="bulk-count">0 selected</span>
-                <label><input type="radio" name="bulk-target" value="existing" checked>
-                    Move to <select id="bulk-target-select"></select></label>
-                <label><input type="radio" name="bulk-target" value="new">
-                    New group <input type="text" id="bulk-new-group-name" placeholder="name (empty = auto)"></label>
-                <button id="bulk-move-btn" class="primary">Move</button>
-                <button id="bulk-delete-btn" class="danger">Delete</button>
-                <button id="bulk-clear-btn" class="secondary">Clear</button>
-            </div>
             <p id="groups-empty" class="muted">No groups yet. Run the grouping or click "Refresh groups".</p>
             <div id="groups-container"></div>
             <div id="pagination" class="pagination hidden">
@@ -110,6 +111,18 @@
             </div>
         </section>
     </main>
+
+    <!-- Floating bulk actions bar -->
+    <div id="bulk-bar" class="hidden">
+        <span id="bulk-count">0 selected</span>
+        <label><input type="radio" name="bulk-target" value="existing" checked>
+            Move to <select id="bulk-target-select"></select></label>
+        <label><input type="radio" name="bulk-target" value="new">
+            New group <input type="text" id="bulk-new-group-name" placeholder="name (empty = auto)"></label>
+        <button id="bulk-move-btn" class="primary">Move</button>
+        <button id="bulk-delete-btn" class="danger">Delete</button>
+        <button id="bulk-clear-btn" class="secondary">Clear</button>
+    </div>
 
     <!-- Move face modal -->
     <div id="move-modal" class="modal-overlay hidden">

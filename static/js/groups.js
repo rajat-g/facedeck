@@ -68,17 +68,21 @@ async function loadStats() {
     } catch (_) {
         return;
     }
-    $("#stats-panel").classList.toggle("hidden", stats.groups === 0);
+    const panel = $("#stats-panel");
+    panel.classList.toggle("hidden", stats.groups === 0);
     if (stats.groups === 0) return;
 
+    const top = stats.largest
+        .slice(0, 3)
+        .map((g) => `${escapeHtml(g.name)} (${g.count})`)
+        .join(", ");
+
     $("#stats-summary").innerHTML = `
-        <span class="chip">${stats.photos} photos processed</span>
-        <span class="chip">${stats.faces} faces total</span>
+        <span class="chip">${stats.photos} photos</span>
+        <span class="chip">${stats.faces} faces</span>
         <span class="chip">${stats.groups} groups</span>
+        ${top ? `<span class="chip chip-top" title="Largest groups">Top: ${top}</span>` : ""}
     `;
-    $("#stats-largest").innerHTML = stats.largest
-        .map((g) => `<li>${escapeHtml(g.name)} — ${g.count} face(s)</li>`)
-        .join("");
 }
 
 /* ---------- Filter / sort / pagination ---------- */
@@ -161,8 +165,10 @@ function renderGroupCard(group) {
         <input type="text" class="group-name" value="${escapeHtml(group.name)}"
                title="Person name (stored in database)">
         <span class="face-count">${group.faces.length} face(s)</span>
-        <button class="rename-btn">Save name</button>
-        <button class="copy-paths-btn" title="Copy source photo paths to clipboard">Copy paths</button>
+        <span class="group-actions">
+            <button class="rename-btn icon-btn" title="Save person name">&#10003;</button>
+            <button class="copy-paths-btn icon-btn" title="Copy source photo paths to clipboard">&#10697;</button>
+        </span>
     `;
     card.appendChild(header);
 
@@ -224,8 +230,7 @@ async function wireCopyPaths(header, group) {
     btn.addEventListener("click", async () => {
         try {
             await navigator.clipboard.writeText(group.image_paths.join("\n"));
-            btn.textContent = "Copied!";
-            setTimeout(() => (btn.textContent = "Copy paths"), 1200);
+            toastSuccess("Source photo paths copied to clipboard.");
         } catch (err) {
             toastError(`Could not copy: ${err.message}`);
         }

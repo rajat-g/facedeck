@@ -80,6 +80,7 @@ export function loadSettings() {
     const theme = saved.theme || "dark";
     document.documentElement.dataset.theme = theme;
     $("#theme-btn").innerHTML = theme === "dark" ? "&#9788;" : "&#9789;";
+    $("#config-panel").classList.toggle("collapsed", !!saved.configCollapsed);
 }
 
 export function saveSettings() {
@@ -92,6 +93,7 @@ export function saveSettings() {
             outputFile: $("#output-file").value,
             threshold: $("#threshold").value,
             theme: document.documentElement.dataset.theme || "dark",
+            configCollapsed: $("#config-panel").classList.contains("collapsed"),
         }),
     );
 }

@@ -22,6 +22,25 @@ import {
 import { openMoveModal } from "./movemodal.js";
 import { undoLast } from "./ops.js";
 
+/* ---------- Config panel collapse & summary ---------- */
+
+function updateConfigSummary() {
+    const folders = $("#input-folders")
+        .value.split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean).length;
+    const db = getDbFile();
+    const dbShort = db.length > 28 ? "…" + db.slice(-27) : db;
+    $("#config-summary").textContent =
+        `${folders} folder${folders === 1 ? "" : "s"} · ${dbShort} · threshold ${parseFloat($("#threshold").value).toFixed(2)}`;
+}
+
+$("#config-toggle").addEventListener("click", () => {
+    $("#config-panel").classList.toggle("collapsed");
+    saveSettings();
+    updateConfigSummary();
+});
+
 /* ---------- Theme ---------- */
 
 $("#theme-btn").addEventListener("click", () => {
@@ -34,18 +53,24 @@ $("#theme-btn").addEventListener("click", () => {
 /* ---------- Config persistence & exports ---------- */
 
 for (const id of ["input-folders", "output-faces", "db-file", "output-file"]) {
-    $(`#${id}`).addEventListener("change", saveSettings);
+    $(`#${id}`).addEventListener("change", () => {
+        saveSettings();
+        updateConfigSummary();
+    });
 }
 $("#threshold").addEventListener("input", () => {
     $("#threshold-value").textContent = parseFloat($("#threshold").value).toFixed(2);
+    updateConfigSummary();
 });
 $("#threshold").addEventListener("change", saveSettings);
 
 $("#refresh-btn").addEventListener("click", loadGroups);
 $("#export-csv-btn").addEventListener("click", () => {
+    document.querySelector("details.menu").removeAttribute("open");
     window.open(`/api/export?format=csv&db_file=${encodeURIComponent(getDbFile())}`, "_blank");
 });
 $("#export-json-btn").addEventListener("click", () => {
+    document.querySelector("details.menu").removeAttribute("open");
     window.open(`/api/export?format=json&db_file=${encodeURIComponent(getDbFile())}`, "_blank");
 });
 
@@ -151,4 +176,5 @@ initLightbox(loadGroups);
 initMoveModal(loadGroups);
 
 loadSettings();
+updateConfigSummary();
 loadGroups();
