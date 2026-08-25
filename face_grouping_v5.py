@@ -20,9 +20,19 @@ def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
+def open_db(db_path: str) -> sqlite3.Connection:
+    """Open (and initialise) the database. Shared by web UI, GUI and CLI."""
+    return _init_db(db_path)
+
+
 def _init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+
+    # Write-ahead logging: readers (web UI) no longer block while a run writes
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
 
     cursor.execute(
         """
@@ -40,10 +50,17 @@ def _init_db(db_path: str) -> sqlite3.Connection:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sum_embedding TEXT NOT NULL,
             count INTEGER NOT NULL,
-            directory TEXT NOT NULL
+            directory TEXT NOT NULL,
+            name TEXT
         )
         """
     )
+
+    # Migration for databases created before the "name" column existed
+    cursor.execute("PRAGMA table_info(groups)")
+    cols = {row[1] for row in cursor.fetchall()}
+    if "name" not in cols:
+        cursor.execute("ALTER TABLE groups ADD COLUMN name TEXT")
 
     cursor.execute(
         """
@@ -63,6 +80,32 @@ def _init_db(db_path: str) -> sqlite3.Connection:
             PRIMARY KEY (group_id, face_id)
         )
         """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS undo_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            details TEXT NOT NULL,
+            undone INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_image_paths_image_path "
+        "ON group_image_paths(image_path)"
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_cropped_faces_face_id "
+        "ON group_cropped_faces(face_id)"
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_undo_log_undone ON undo_log(undone, id)"
     )
 
     conn.commit()
@@ -88,8 +131,8 @@ def load_processed_state(db_path):
         processed_files[file_path] = (mtime, size)
 
     groups = []
-    for group_id, sum_embedding_str, count, directory in cursor.execute(
-        "SELECT id, sum_embedding, count, directory FROM groups ORDER BY id"
+    for group_id, sum_embedding_str, count, directory, name in cursor.execute(
+        "SELECT id, sum_embedding, count, directory, name FROM groups ORDER BY id"
     ):
         if sum_embedding_str:
             sum_embedding = np.fromstring(sum_embedding_str, sep=",", dtype=np.float32)
@@ -116,6 +159,7 @@ def load_processed_state(db_path):
                 "id": group_id,
                 "sum_embedding": sum_embedding,
                 "count": count,
+                "name": name,
                 "image_paths": image_paths,
                 "directory": Path(directory),
                 "cropped_faces": cropped_faces,
@@ -140,6 +184,10 @@ def save_processed_state(conn, processed_files, groups):
         )
 
     # Replace groups and their associated paths/faces
+    # Preserve person names across the rewrite
+    cursor.execute("SELECT id, name FROM groups")
+    existing_names = {row[0]: row[1] for row in cursor.fetchall()}
+
     cursor.execute("DELETE FROM group_image_paths")
     cursor.execute("DELETE FROM group_cropped_faces")
     cursor.execute("DELETE FROM groups")
@@ -153,12 +201,14 @@ def save_processed_state(conn, processed_files, groups):
 
         directory = str(group["directory"])
         count = int(group["count"])
+        group_id = group.get("id", idx)
+        name = group.get("name") or existing_names.get(group_id)
 
         cursor.execute(
-            "INSERT INTO groups(id, sum_embedding, count, directory) VALUES (?, ?, ?, ?)",
-            (group.get("id", idx), sum_embedding_str, count, directory),
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (group_id, sum_embedding_str, count, directory, name),
         )
-        group_id = group.get("id", idx)
 
         for image_path in group["image_paths"]:
             cursor.execute(

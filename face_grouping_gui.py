@@ -3,10 +3,9 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-import sqlite3
 from PIL import Image, ImageTk
 
-from face_grouping_v5 import load_processed_state, main as cli_main
+from face_grouping_v5 import load_processed_state, open_db, main as cli_main
 
 
 class FaceGroupingApp(tk.Tk):
@@ -266,7 +265,7 @@ class FaceGroupingApp(tk.Tk):
         index = int(selection[0])
         self.selected_group_index = index
         group = self.groups[index]
-        self.group_name_var.set(Path(group["directory"]).name)
+        self.group_name_var.set(group.get("name") or Path(group["directory"]).name)
         self._show_thumbnails_for_group(index)
 
     def _on_face_click(self, face_path: str) -> None:
@@ -346,7 +345,7 @@ class FaceGroupingApp(tk.Tk):
         self.groups = groups
         self.group_list.delete(0, "end")
         for idx, g in enumerate(groups, start=1):
-            name = Path(g["directory"]).name
+            name = g.get("name") or Path(g["directory"]).name
             self.group_list.insert("end", f"{idx}: {name}")
         self._append_log(f"Loaded {len(groups)} groups from database.")
 
@@ -361,28 +360,26 @@ class FaceGroupingApp(tk.Tk):
             return
 
         group = self.groups[self.selected_group_index]
-        old_dir = Path(group["directory"])
-        new_dir = old_dir.parent / new_name
 
-        if new_dir.exists():
-            messagebox.showerror(
-                "Error", "A folder with this name already exists in the same location."
-            )
+        if not self.current_db_file:
+            messagebox.showerror("Error", "No database file selected.")
             return
 
         try:
-            old_dir.rename(new_dir)
-            group["directory"] = new_dir
-
-            if self.current_db_file:
-                conn = sqlite3.connect(self.current_db_file)
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE groups SET directory=? WHERE id=?",
-                    (str(new_dir), group["id"]),
-                )
-                conn.commit()
+            conn = open_db(self.current_db_file)
+            row = conn.execute(
+                "SELECT id FROM groups WHERE id=?", (group["id"],)
+            ).fetchone()
+            if row is None:
                 conn.close()
+                messagebox.showerror("Error", "Group not found in database.")
+                return
+            conn.execute(
+                "UPDATE groups SET name=? WHERE id=?", (new_name, group["id"])
+            )
+            conn.commit()
+            conn.close()
+            group["name"] = new_name
 
             # Update UI list
             self.group_list.delete(self.selected_group_index)
@@ -390,9 +387,7 @@ class FaceGroupingApp(tk.Tk):
                 self.selected_group_index,
                 f"{self.selected_group_index + 1}: {new_name}",
             )
-            self._append_log(f"Renamed group folder to: {new_dir}")
-            # Refresh thumbnails for this group
-            self._show_thumbnails_for_group(self.selected_group_index)
+            self._append_log(f"Renamed person to: {new_name}")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Error", f"Failed to rename group: {exc}")
 

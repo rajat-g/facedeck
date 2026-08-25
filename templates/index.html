@@ -10,14 +10,18 @@
     <header>
         <h1>InsightFace Photo Grouping</h1>
         <p>Detect faces in a folder of photos and group them by person.</p>
+        <button id="theme-btn" title="Toggle dark/light theme">&#9789;</button>
     </header>
 
     <main>
         <section id="config-panel" class="card">
             <h2>Configuration</h2>
             <div class="form-row">
-                <label for="input-folder">Input folder</label>
-                <input type="text" id="input-folder" placeholder="C:\path\to\photos">
+                <label for="input-folders">Input folders (one per line)</label>
+                <div class="input-with-btn">
+                    <textarea id="input-folders" rows="2" placeholder="C:\path\to\photos&#10;C:\other\photos"></textarea>
+                    <button type="button" id="browse-folder-btn">Add...</button>
+                </div>
             </div>
             <div class="form-row-grid">
                 <div class="form-row">
@@ -26,7 +30,10 @@
                 </div>
                 <div class="form-row">
                     <label for="db-file">Database file</label>
-                    <input type="text" id="db-file" value="processing_state.db">
+                    <div class="input-with-btn">
+                        <input type="text" id="db-file" value="processing_state.db">
+                        <button type="button" id="browse-db-btn">Browse...</button>
+                    </div>
                 </div>
             </div>
             <div class="form-row-grid">
@@ -41,7 +48,11 @@
             </div>
             <div class="actions">
                 <button id="run-btn" class="primary">Start grouping</button>
+                <button id="cancel-btn" class="danger hidden">Cancel run</button>
                 <button id="refresh-btn">Refresh groups</button>
+                <button id="undo-btn" title="Undo last move or delete">Undo</button>
+                <button id="export-csv-btn">Export CSV</button>
+                <button id="export-json-btn">Export JSON</button>
             </div>
         </section>
 
@@ -55,10 +66,48 @@
             <div id="error-box" class="error-box hidden"></div>
         </section>
 
+        <section id="stats-panel" class="card hidden">
+            <h2>Stats</h2>
+            <div id="stats-summary" class="stats-chips"></div>
+            <ol id="stats-largest"></ol>
+        </section>
+
         <section id="groups-panel">
-            <h2>Face Groups</h2>
+            <div class="groups-toolbar">
+                <h2>Face Groups</h2>
+                <div class="filters">
+                    <input type="search" id="filter-text" placeholder="Filter by name or source photo...">
+                    <label class="min-faces">Min faces
+                        <input type="number" id="filter-min-faces" min="0" value="0" style="width:60px">
+                    </label>
+                    <label class="min-faces">Sort
+                        <select id="sort-by">
+                            <option value="default">Default</option>
+                            <option value="name">Name A-Z</option>
+                            <option value="size-desc">Most faces</option>
+                            <option value="size-asc">Fewest faces</option>
+                            <option value="newest">Newest activity</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            <div id="bulk-bar" class="hidden">
+                <span id="bulk-count">0 selected</span>
+                <label><input type="radio" name="bulk-target" value="existing" checked>
+                    Move to <select id="bulk-target-select"></select></label>
+                <label><input type="radio" name="bulk-target" value="new">
+                    New group <input type="text" id="bulk-new-group-name" placeholder="name (empty = auto)"></label>
+                <button id="bulk-move-btn" class="primary">Move</button>
+                <button id="bulk-delete-btn" class="danger">Delete</button>
+                <button id="bulk-clear-btn" class="secondary">Clear</button>
+            </div>
             <p id="groups-empty" class="muted">No groups yet. Run the grouping or click "Refresh groups".</p>
             <div id="groups-container"></div>
+            <div id="pagination" class="pagination hidden">
+                <button id="page-prev">&larr; Prev</button>
+                <span id="page-info"></span>
+                <button id="page-next">Next &rarr;</button>
+            </div>
         </section>
     </main>
 
@@ -80,6 +129,22 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='app.js') }}"></script>
+    <!-- Lightbox -->
+    <div id="lightbox" class="modal-overlay hidden">
+        <div class="lightbox-content card">
+            <div class="lightbox-header">
+                <span id="lightbox-title"></span>
+                <button id="lightbox-close" class="secondary">&times;</button>
+            </div>
+            <img id="lightbox-img" alt="">
+            <div id="lightbox-sources"></div>
+            <div class="actions">
+                <button id="lightbox-move" class="secondary">Move face (M)</button>
+                <button id="lightbox-delete" class="danger">Delete face (Del)</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
 </body>
 </html>

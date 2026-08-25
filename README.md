@@ -42,11 +42,19 @@ python face_grouping_web.py
 Then open http://127.0.0.1:5000 in your browser.
 
 The web UI lets you:
-- Select an input folder and start grouping with a live progress bar and log
-- View all face groups as thumbnail grids
-- Rename groups (renames the folder on disk too)
-- Remove incorrect/unwanted faces from groups
-- Move a face to a different group or into a newly created group
+- Pick input folders (multiple supported) and DB file with native folder/file dialogs
+- Start grouping with a live progress bar, log, and a cancel button
+- View all face groups as thumbnail grids with search/filter, sorting, and pagination
+- Name people (stored in the database) shown on group cards
+- View a face in a lightbox together with the source photo(s) it came from
+- Remove incorrect/unwanted faces (moved to a `.trash` folder) and undo moves/deletes
+- Select multiple faces (Ctrl-click / Shift-click) or drag-and-drop them between groups
+- Copy all source photo paths of a group to the clipboard
+- See stats (photos processed, faces, largest groups)
+- Export groups as CSV or JSON
+- Toggle dark/light theme; settings are remembered in localStorage
+- Keyboard shortcuts: arrow keys navigate faces, Enter opens lightbox,
+  M moves, Delete removes, Esc closes dialogs
 
 ### CLI
 
