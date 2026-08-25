@@ -1,0 +1,37 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Face Grouping Application Overview
+
+This application processes images to detect and group similar faces using the InsightFace library. The main functionality is implemented in [face_grouping_v5.py](mdc:face_grouping_v5.py).
+
+## Key Features
+- Face detection and embedding generation using InsightFace
+- Support for multiple image formats including HEIC/HEIF
+- Face grouping based on cosine similarity
+- State tracking to resume processing
+- Face cropping and organization into groups
+
+## Main Components
+1. Image Processing
+   - Supports multiple image formats (JPG, PNG, HEIC, etc.)
+   - Uses OpenCV for image handling
+   - Converts HEIC/HEIF to BGR format
+
+2. Face Analysis
+   - Uses InsightFace's FaceAnalysis model
+   - Generates face embeddings for similarity comparison
+   - Detects face bounding boxes for cropping
+
+3. Grouping Logic
+   - Groups faces based on cosine similarity threshold
+   - Maintains running average of face embeddings
+   - Organizes cropped faces into group directories
+
+4. State Management
+   - Tracks processed files and their modifications
+   - Saves processing state to resume later
+   - Handles file changes and updates
+

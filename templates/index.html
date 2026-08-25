@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InsightFace Photo Grouping</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header>
+        <h1>InsightFace Photo Grouping</h1>
+        <p>Detect faces in a folder of photos and group them by person.</p>
+    </header>
+
+    <main>
+        <section id="config-panel" class="card">
+            <h2>Configuration</h2>
+            <div class="form-row">
+                <label for="input-folder">Input folder</label>
+                <input type="text" id="input-folder" placeholder="C:\path\to\photos">
+            </div>
+            <div class="form-row-grid">
+                <div class="form-row">
+                    <label for="output-faces">Output faces folder</label>
+                    <input type="text" id="output-faces" value="output_faces">
+                </div>
+                <div class="form-row">
+                    <label for="db-file">Database file</label>
+                    <input type="text" id="db-file" value="processing_state.db">
+                </div>
+            </div>
+            <div class="form-row-grid">
+                <div class="form-row">
+                    <label for="output-file">Report file</label>
+                    <input type="text" id="output-file" value="face_groups.txt">
+                </div>
+                <div class="form-row">
+                    <label for="threshold">Similarity threshold: <span id="threshold-value">0.60</span></label>
+                    <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
+                </div>
+            </div>
+            <div class="actions">
+                <button id="run-btn" class="primary">Start grouping</button>
+                <button id="refresh-btn">Refresh groups</button>
+            </div>
+        </section>
+
+        <section id="status-panel" class="card hidden">
+            <h2>Status</h2>
+            <div class="progress-wrap">
+                <div id="progress-bar"></div>
+                <span id="progress-text">0 / 0</span>
+            </div>
+            <pre id="log-output"></pre>
+            <div id="error-box" class="error-box hidden"></div>
+        </section>
+
+        <section id="groups-panel">
+            <h2>Face Groups</h2>
+            <p id="groups-empty" class="muted">No groups yet. Run the grouping or click "Refresh groups".</p>
+            <div id="groups-container"></div>
+        </section>
+    </main>
+
+    <!-- Move face modal -->
+    <div id="move-modal" class="modal-overlay hidden">
+        <div class="modal card">
+            <h2>Move face</h2>
+            <img id="move-preview" alt="">
+            <div class="move-options">
+                <label><input type="radio" name="move-target" value="existing" checked> Move to existing group:</label>
+                <select id="move-target-select"></select>
+                <label><input type="radio" name="move-target" value="new"> Create new group named:</label>
+                <input type="text" id="move-new-name" placeholder="e.g. John (leave empty for auto)">
+            </div>
+            <div class="actions">
+                <button id="move-cancel" class="secondary">Cancel</button>
+                <button id="move-confirm" class="primary">Move</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

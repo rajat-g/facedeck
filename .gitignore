@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+Output/
+output_faces/
+Test/
+*.heic
+*.heif
+face_groups.txt
+processing_state.db
+processing_state.json
+results.txt
