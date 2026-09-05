@@ -4,7 +4,7 @@ import { $, api, getDbFile, loadSettings, saveSettings, state } from "./core.js"
 import { toastSuccess } from "./toast.js";
 import { initBrowse } from "./browse.js";
 import { initRun } from "./run.js";
-import { initGroups, loadGroups } from "./groups.js";
+import { initGroups, loadGroups, selectPerson } from "./groups.js";
 import { closeLightbox, initLightbox, lightboxIsOpen, lightboxNavigate, openFaceViewer } from "./lightbox.js";
 import { closeMoveModal, initMoveModal, moveModalIsOpen, openMoveModal } from "./movemodal.js";
 import { undoLast } from "./ops.js";
@@ -112,6 +112,14 @@ document.addEventListener("request-move", (e) => {
     if (!tile?.dataset) return;
     const group = state.groups.find((g) => g.id == tile.dataset.groupId);
     if (group) openMoveModal(group, tile.dataset.filename);
+});
+
+/* Face-tag click in the viewer jumps to that person */
+document.addEventListener("select-person", (e) => {
+    const id = e.detail?.groupId;
+    if (id == null) return;
+    closeLightbox();
+    selectPerson(id);
 });
 
 /* ---------- Init ---------- */

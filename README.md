@@ -52,6 +52,7 @@ The web UI lets you:
     "Open folder" reveals the whole group folder without loading anything in the browser
 - Name people (stored in the database) shown on group cards
 - View a face in a lightbox together with the source photo(s) it came from
+- Face tags on source photos: hover boxes with names (Facebook-style), click a tag to open that person
 - Remove incorrect/unwanted faces (moved to a `.trash` folder) and undo moves/deletes
 - Select multiple faces (Ctrl-click / Shift-click) or drag-and-drop them between groups
 - Copy all source photo paths of a group to the clipboard
@@ -90,7 +91,12 @@ python face_grouping_v5.py \
 
 1. `face_groups.txt`: Contains the list of images grouped by detected faces
 2. `output_faces/`: Directory containing subdirectories for each face group with cropped face images
-3. `processing_state.db`: SQLite database tracking processed files and groups for incremental processing
+3. `processing_state.db`: SQLite database tracking processed files, groups, and per-photo face-tag boxes for incremental processing
+
+Face tags are recorded during grouping (normalised boxes + owning group per face).
+Tags follow renames and moves, survive "approve", and are hidden for trashed faces.
+Photos processed before tagging show no boxes until re-processed.
+EXIF orientation is normalised at detection and serving time so boxes land correctly.
 
 ## Notes
 

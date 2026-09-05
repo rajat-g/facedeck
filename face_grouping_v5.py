@@ -5,16 +5,61 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pillow_heif
+from PIL import Image, ImageOps
 from insightface.app import FaceAnalysis
 
 
 def read_image(file_path):
-    if file_path.lower().endswith(('.heic', '.heif')):
+    """Decode an image to BGR numpy array, honouring EXIF orientation.
+
+    Normalising orientation here (instead of letting each viewer rotate)
+    keeps detection coordinates, saved crops and served previews in the
+    same pixel space, which face-tag overlays rely on.
+    """
+    if str(file_path).lower().endswith(('.heic', '.heif')):
         heif_file = pillow_heif.open_heif(file_path)
         image = np.array(heif_file)
         return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    else:
+    try:
+        with Image.open(file_path) as pil_img:
+            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    except Exception:
         return cv2.imread(str(file_path))
+
+
+def record_photo_face(conn, image_path, face_idx, face_id, bbox, img_shape, group_id):
+    """Upsert one Facebook-style face tag (normalised 0-1 bbox + owning group)."""
+    h, w = img_shape[:2]
+    if h <= 0 or w <= 0:
+        return
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    x1 = min(max(x1, 0.0), float(w))
+    y1 = min(max(y1, 0.0), float(h))
+    x2 = min(max(x2, 0.0), float(w))
+    y2 = min(max(y2, 0.0), float(h))
+    if x2 <= x1 or y2 <= y1:
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO photo_faces"
+        "(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        (
+            str(image_path),
+            int(face_idx),
+            str(face_id),
+            x1 / w,
+            y1 / h,
+            x2 / w,
+            y2 / h,
+            int(group_id) if group_id is not None else None,
+        ),
+    )
+
+
+def reset_photo_faces(conn, image_path):
+    """Drop stale tags for an image about to be (re)processed."""
+    conn.execute("DELETE FROM photo_faces WHERE image_path=?", (str(image_path),))
 
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -84,6 +129,23 @@ def _init_db(db_path: str) -> sqlite3.Connection:
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS photo_faces (
+            image_path TEXT NOT NULL,
+            face_idx INTEGER NOT NULL,
+            face_id TEXT NOT NULL,
+            x1 REAL NOT NULL,
+            y1 REAL NOT NULL,
+            x2 REAL NOT NULL,
+            y2 REAL NOT NULL,
+            group_id INTEGER,
+            detached INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (image_path, face_idx)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS undo_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,
@@ -102,6 +164,16 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_group_cropped_faces_face_id "
         "ON group_cropped_faces(face_id)"
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photo_faces_image_path "
+        "ON photo_faces(image_path)"
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photo_faces_face_id "
+        "ON photo_faces(face_id)"
     )
 
     cursor.execute(
@@ -281,20 +353,24 @@ def main():
                 processed_files[file_key] = (current_mtime, current_size)
 
     # Process new/changed files
+    id_counter = max(
+        (g["id"] for g in groups if isinstance(g.get("id"), int)), default=0
+    )
     for img_path in new_files:
         try:
             img = read_image(str(img_path))
             if img is None:
                 print(f"Could not read image: {img_path}")
                 continue
-            
+
+            reset_photo_faces(conn, str(img_path))
             faces = app.get(img)
-            
+
             for face_idx, face in enumerate(faces):
                 embedding = face.embedding
                 max_sim = -1
                 best_group = None
-                
+
                 # Find best matching group
                 for group in groups:
                     avg_embed = group['sum_embedding'] / group['count']
@@ -302,26 +378,36 @@ def main():
                     if sim > max_sim:
                         max_sim = sim
                         best_group = group
-                
+
                 face_id = f"{img_path.stem}_{face_idx}"
                 output_path = None
-                
+
                 if max_sim >= args.threshold:
                     # Check if face was already cropped for this group
                     if face_id in best_group['cropped_faces']:
+                        record_photo_face(
+                            conn, str(img_path), face_idx, face_id,
+                            face.bbox, img.shape, best_group.get("id"),
+                        )
                         continue
-                        
+
                     best_group['sum_embedding'] += embedding
                     best_group['count'] += 1
                     best_group['image_paths'].add(str(img_path))
                     best_group['cropped_faces'].add(face_id)
                     output_path = best_group['directory'] / f"{face_id}.jpg"
+                    record_photo_face(
+                        conn, str(img_path), face_idx, face_id,
+                        face.bbox, img.shape, best_group.get("id"),
+                    )
                 else:
                     group_number = len(groups) + 1
                     group_dir = output_faces_dir / f"group_{group_number}"
                     group_dir.mkdir(parents=True, exist_ok=True)
                     output_path = group_dir / f"{face_id}.jpg"
+                    id_counter += 1
                     best_group = {
+                        'id': id_counter,
                         'sum_embedding': embedding.copy(),
                         'count': 1,
                         'image_paths': {str(img_path)},
@@ -329,6 +415,10 @@ def main():
                         'cropped_faces': {face_id}
                     }
                     groups.append(best_group)
+                    record_photo_face(
+                        conn, str(img_path), face_idx, face_id,
+                        face.bbox, img.shape, id_counter,
+                    )
 
                 # Save face crop if needed
                 if output_path and not output_path.exists():

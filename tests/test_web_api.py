@@ -243,6 +243,163 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class PhotoTagsTestCase(unittest.TestCase):
+    """Facebook-style face tags: multi-face photos, moves, deletes, approve."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-tags-"))
+        self.db_file = self.tmp / "state.db"
+        self.out_root = self.tmp / "output_faces"
+
+        self.g1 = self.out_root / "group_1"
+        self.g2 = self.out_root / "group_2"
+        self.g1.mkdir(parents=True)
+        self.g2.mkdir(parents=True)
+
+        for name in ("p1_0.jpg", "p1_2.jpg", "p2_0.jpg"):
+            make_face_file(self.g1, name)
+        make_face_file(self.g2, "p1_1.jpg")
+
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, '', 1, ?, ?)",
+            [(1, str(self.g1), "Alice"), (2, str(self.g2), "Bob")],
+        )
+        conn.executemany(
+            "INSERT INTO group_image_paths VALUES (?, ?)",
+            [
+                (1, "C:/photos/p1.jpg"),
+                (1, "C:/photos/p2.jpg"),
+                (2, "C:/photos/p1.jpg"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO group_cropped_faces VALUES (?, ?)",
+            [(1, "p1_0"), (2, "p1_1"), (1, "p1_2"), (1, "p2_0")],
+        )
+        # One photo with faces of TWO people + a second photo with one face.
+        conn.executemany(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            [
+                ("C:/photos/p1.jpg", 0, "p1_0", 0.1, 0.1, 0.3, 0.4, 1),
+                ("C:/photos/p1.jpg", 1, "p1_1", 0.4, 0.2, 0.6, 0.5, 2),
+                ("C:/photos/p1.jpg", 2, "p1_2", 0.7, 0.1, 0.9, 0.4, 1),
+                ("C:/photos/p2.jpg", 0, "p2_0", 0.2, 0.2, 0.5, 0.6, 1),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def get_tags(self, group_id, path):
+        return self.client.get(
+            f"/api/photo-tags?{self.q}&group_id={group_id}&path={path}"
+        )
+
+    def test_multi_face_photo_returns_each_person(self):
+        resp = self.get_tags(1, "C:/photos/p1.jpg")
+        self.assertEqual(resp.status_code, 200)
+        tags = resp.get_json()["tags"]
+        self.assertEqual([t["face_id"] for t in tags], ["p1_0", "p1_1", "p1_2"])
+        self.assertEqual([t["name"] for t in tags], ["Alice", "Bob", "Alice"])
+        self.assertEqual(tags[0]["bbox"], [0.1, 0.1, 0.3, 0.4])
+        self.assertEqual(tags[0]["group_id"], 1)
+        self.assertEqual(tags[1]["group_id"], 2)
+
+    def test_tags_guard_blocks_unknown_path(self):
+        resp = self.get_tags(1, "C:/Windows/win.ini")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_tags_follow_rename(self):
+        self.client.post(
+            "/api/groups/1/rename",
+            json={"name": "Alicia", "db_file": str(self.db_file)},
+        )
+        tags = self.get_tags(1, "C:/photos/p1.jpg").get_json()["tags"]
+        self.assertEqual(tags[0]["name"], "Alicia")
+        self.assertEqual(tags[2]["name"], "Alicia")
+        self.assertEqual(tags[1]["name"], "Bob")
+
+    def test_tags_follow_move(self):
+        resp = self.client.post(
+            "/api/faces/move",
+            json={
+                "group_id": 1,
+                "filename": "p1_0.jpg",
+                "target_group_id": 2,
+                "db_file": str(self.db_file),
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        tags = self.get_tags(2, "C:/photos/p1.jpg").get_json()["tags"]
+        by_face = {t["face_id"]: t for t in tags}
+        self.assertEqual(by_face["p1_0"]["name"], "Bob")
+        self.assertEqual(by_face["p1_0"]["group_id"], 2)
+
+    def test_delete_hides_tag_and_undo_restores(self):
+        resp = self.client.delete(f"/api/groups/1/faces/p2_0.jpg?{self.q}")
+        self.assertEqual(resp.status_code, 200)
+        tags = self.get_tags(1, "C:/photos/p2.jpg").get_json()["tags"]
+        self.assertEqual(tags, [])
+
+        undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
+        self.assertEqual(undo.status_code, 200)
+        tags = self.get_tags(1, "C:/photos/p2.jpg").get_json()["tags"]
+        self.assertEqual(len(tags), 1)
+        self.assertEqual(tags[0]["name"], "Alice")
+
+    def test_approve_keeps_tags_via_stored_group(self):
+        resp = self.client.post(
+            f"/api/groups/1/approve", json={"db_file": str(self.db_file)}
+        )
+        self.assertEqual(resp.status_code, 200)
+        tags = self.get_tags(1, "C:/photos/p1.jpg").get_json()["tags"]
+        by_face = {t["face_id"]: t for t in tags}
+        # Mappings were wiped by approve, but stored group keeps the labels.
+        self.assertEqual(by_face["p1_0"]["name"], "Alice")
+        self.assertEqual(by_face["p1_2"]["name"], "Alice")
+        self.assertEqual(by_face["p1_1"]["name"], "Bob")
+
+    def test_record_helpers_normalise_and_reset(self):
+        from face_grouping_v5 import record_photo_face, reset_photo_faces
+
+        conn = open_db(str(self.db_file))
+        record_photo_face(
+            conn, "C:/photos/p3.jpg", 0, "p3_0",
+            (10.0, 20.0, 110.0, 220.0), (400, 200, 3), 2,
+        )
+        # Degenerate boxes are ignored.
+        record_photo_face(
+            conn, "C:/photos/p3.jpg", 1, "p3_1",
+            (5.0, 5.0, 5.0, 9.0), (400, 200, 3), 2,
+        )
+        conn.commit()
+        rows = conn.execute(
+            "SELECT face_id, x1, y1, x2, y2, group_id FROM photo_faces "
+            "WHERE image_path='C:/photos/p3.jpg' ORDER BY face_idx"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0]["x1"], rows[0]["y1"], rows[0]["x2"], rows[0]["y2"]),
+            (0.05, 0.05, 0.55, 0.55),
+        )
+        reset_photo_faces(conn, "C:/photos/p3.jpg")
+        conn.commit()
+        left = conn.execute(
+            "SELECT COUNT(*) FROM photo_faces WHERE image_path='C:/photos/p3.jpg'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(left, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

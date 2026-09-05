@@ -169,6 +169,18 @@ function selectedGroup() {
     return state.groups.find((g) => g.id === state.selectedId) || null;
 }
 
+export function selectPerson(groupId) {
+    if (state.selectedId === groupId) return;
+    if (!state.groups.some((g) => g.id === groupId)) return;
+    state.selectedId = groupId;
+    resetViewers();
+    state.selection.clear();
+    renderPeople();
+    renderDetail();
+    updateBulkBar();
+    document.querySelector("#person-detail")?.scrollIntoView({ block: "nearest" });
+}
+
 /* ---------- People list ---------- */
 
 function renderPeople() {
@@ -225,14 +237,7 @@ function renderPersonRow(g) {
         `<span class="person-side"><span class="status-dot ${approved ? "approved" : "pending"}" title="${approved ? "Approved" : "Pending"}"></span>` +
         `<span class="chev">›</span></span>`;
     btn.addEventListener("click", () => {
-        if (state.selectedId !== g.id) {
-            state.selectedId = g.id;
-            resetViewers();
-            state.selection.clear();
-            renderPeople();
-            renderDetail();
-            updateBulkBar();
-        }
+        selectPerson(g.id);
     });
     btn.addEventListener("dragover", (e) => { e.preventDefault(); btn.classList.add("drop-target"); });
     btn.addEventListener("dragleave", () => btn.classList.remove("drop-target"));

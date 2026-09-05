@@ -19,6 +19,8 @@ from face_grouping_v5 import (
     load_processed_state,
     open_db,
     read_image,
+    record_photo_face,
+    reset_photo_faces,
     save_processed_state,
 )
 
@@ -213,6 +215,7 @@ def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_fil
                     log(f"Could not read image: {img_path}")
                     continue
 
+                reset_photo_faces(conn, str(img_path))
                 faces = face_app.get(img)
 
                 for face_idx, face in enumerate(faces):
@@ -232,12 +235,20 @@ def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_fil
 
                     if max_sim >= threshold and best_group is not None:
                         if face_id in best_group["cropped_faces"]:
+                            record_photo_face(
+                                conn, str(img_path), face_idx, face_id,
+                                face.bbox, img.shape, best_group["id"],
+                            )
                             continue
                         best_group["sum_embedding"] += embedding
                         best_group["count"] += 1
                         best_group["image_paths"].add(str(img_path))
                         best_group["cropped_faces"].add(face_id)
                         output_path = best_group["directory"] / f"{face_id}.jpg"
+                        record_photo_face(
+                            conn, str(img_path), face_idx, face_id,
+                            face.bbox, img.shape, best_group["id"],
+                        )
                     else:
                         number = next_group_number(conn, out_root)
                         while (out_root / f"group_{number}").exists():
@@ -256,6 +267,10 @@ def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_fil
                         }
                         groups.append(new_group)
                         matchable.append(new_group)
+                        record_photo_face(
+                            conn, str(img_path), face_idx, face_id,
+                            face.bbox, img.shape, id_counter,
+                        )
 
                     if output_path and not output_path.exists():
                         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -684,6 +699,11 @@ def trash_face(conn, group_id, filename):
         "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
         (group_id, src.stem),
     )
+    # Detach any face tags so the removed face stops being labelled.
+    conn.execute(
+        "UPDATE photo_faces SET detached=1 WHERE face_id=?",
+        (src.stem,),
+    )
     return {
         "face_path": str(src),
         "trash_path": str(trash_path),
@@ -854,6 +874,11 @@ def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
         "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) VALUES (?, ?)",
         (dst_group_id, face_id),
     )
+    # Follow the move so tags label the face with its new person.
+    conn.execute(
+        "UPDATE photo_faces SET group_id=?, detached=0 WHERE face_id=?",
+        (dst_group_id, face_id),
+    )
     return {
         "src_path": str(src_path),
         "dst_path": str(dst_path),
@@ -910,6 +935,10 @@ def undo_item(conn, item):
             "VALUES (?, ?)",
             (item["group_id"], item["face_id"]),
         )
+        conn.execute(
+            "UPDATE photo_faces SET detached=0 WHERE face_id=?",
+            (item["face_id"],),
+        )
         return f"restored {face_path.name}"
 
     # Undo of a move: put the file back into the source group
@@ -923,6 +952,10 @@ def undo_item(conn, item):
     )
     conn.execute(
         "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) VALUES (?, ?)",
+        (item["src_group_id"], item["face_id"]),
+    )
+    conn.execute(
+        "UPDATE photo_faces SET group_id=? WHERE face_id=?",
         (item["src_group_id"], item["face_id"]),
     )
     return f"moved {src_path.name} back"
@@ -1138,7 +1171,104 @@ def api_source_image():
             traceback.print_exc()
             return jsonify({"error": f"HEIC preview failed: {exc}"}), 500
 
+    # Photos with an EXIF orientation flag are served transposed so the
+    # displayed pixels match detection space (face-tag boxes stay correct).
+    # Anything else takes the fast path: original bytes, zero overhead.
+    try:
+        converted = _oriented_jpeg_bytes(path)
+    except Exception:
+        traceback.print_exc()
+        converted = None
+    if converted is not None:
+        return send_file(
+            io.BytesIO(converted),
+            mimetype="image/jpeg",
+            as_attachment=False,
+            download_name=Path(path).stem + ".jpg",
+            max_age=3600,
+        )
+
     return send_file(path, max_age=3600)
+
+
+def _oriented_jpeg_bytes(path):
+    """JPEG bytes in display orientation, or None when no rotation is needed.
+
+    Browsers auto-rotate by EXIF but detection runs on the transposed pixels
+    (see read_image), so rotated photos must be served transposed for face-tag
+    boxes to land correctly. Photos without an orientation flag are served
+    untouched via the fast path below.
+    """
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as img:
+        try:
+            orientation = (img.getexif().get(0x0112) or 1)
+        except Exception:
+            return None
+        if orientation == 1:
+            return None
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=90)
+        return buf.getvalue()
+
+
+@app.route("/api/photo-tags")
+def api_photo_tags():
+    """Facebook-style face tags for one source photo.
+
+    Returns normalised 0-1 boxes with the CURRENT owning group: moves are
+    followed through face_id, renames resolve live, approved groups fall back
+    to the stored group, and trashed faces are hidden.
+    """
+    db_file = request.args.get("db_file", "processing_state.db")
+    try:
+        group_id = int(request.args.get("group_id", ""))
+    except ValueError:
+        return jsonify({"error": "Invalid group id"}), 400
+    path = (request.args.get("path") or "").strip()
+
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+
+    conn = open_db(db_file)
+    allowed = conn.execute(
+        "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
+        (group_id, path),
+    ).fetchone()
+    if not allowed:
+        conn.close()
+        return jsonify({"error": "Image not associated with this group"}), 404
+
+    rows = conn.execute(
+        "SELECT pf.face_idx, pf.face_id, pf.x1, pf.y1, pf.x2, pf.y2, "
+        "COALESCE(cf.group_id, pf.group_id) AS group_id, g.name, g.directory "
+        "FROM photo_faces pf "
+        "LEFT JOIN group_cropped_faces cf ON cf.face_id = pf.face_id "
+        "LEFT JOIN groups g ON g.id = COALESCE(cf.group_id, pf.group_id) "
+        "WHERE pf.image_path=? AND pf.detached=0 "
+        "ORDER BY pf.face_idx",
+        (path,),
+    ).fetchall()
+    conn.close()
+
+    tags = []
+    for r in rows:
+        if r["directory"]:
+            name = r["name"] or Path(r["directory"]).name
+        else:
+            name = r["name"] or "Unknown"
+        tags.append(
+            {
+                "face_idx": r["face_idx"],
+                "face_id": r["face_id"],
+                "bbox": [r["x1"], r["y1"], r["x2"], r["y2"]],
+                "group_id": r["group_id"],
+                "name": name,
+            }
+        )
+    return jsonify({"tags": tags})
 
 
 # ---------- Approve (permanent crop deletion) ----------

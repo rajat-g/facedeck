@@ -1,6 +1,6 @@
 /* Single-image viewer: loads only one image at a time (scalable). */
 
-import { $, basename, escapeHtml, faceUrl, sourceUrl, state } from "./core.js";
+import { $, api, basename, escapeHtml, faceUrl, sourceUrl, state } from "./core.js";
 import { deleteFaces, revealInExplorer } from "./ops.js";
 import { toastSuccess } from "./toast.js";
 
@@ -143,5 +143,61 @@ function renderViewer() {
         hint.className = "muted small";
         hint.textContent = "Tip: use ← → to step through this page. Refine search or change pages in the detail panel for more.";
         box.appendChild(hint);
+        loadFaceTags(lb, current, box);
     }
+}
+
+async function fetchTags(groupId, srcPath) {
+    try {
+        const data = await api(
+            `/api/photo-tags?group_id=${groupId}&path=${encodeURIComponent(srcPath)}`
+        );
+        return data.tags || [];
+    } catch (_) {
+        return [];
+    }
+}
+
+function loadFaceTags(lb, srcPath, box) {
+    // Clear any overlay from the previous photo immediately.
+    document.querySelector("#lightbox-imgwrap .tag-layer")?.remove();
+    fetchTags(lb.groupId, srcPath).then((tags) => {
+        if (state.lightbox !== lb) return; // user already moved on
+        if (tags.length === 0) {
+            const note = document.createElement("div");
+            note.className = "muted small";
+            note.textContent =
+                "No face tags on this photo yet — it was processed before tagging. Re-run grouping to add them.";
+            box.appendChild(note);
+            return;
+        }
+        const wrap = document.querySelector("#lightbox-imgwrap");
+        if (!wrap) return;
+        const layer = document.createElement("div");
+        layer.className = "tag-layer";
+        for (const t of tags) {
+            const [x1, y1, x2, y2] = t.bbox;
+            const el = document.createElement("div");
+            el.className = "face-tag-box";
+            el.style.left = `${x1 * 100}%`;
+            el.style.top = `${y1 * 100}%`;
+            el.style.width = `${Math.max(0, (x2 - x1)) * 100}%`;
+            el.style.height = `${Math.max(0, (y2 - y1)) * 100}%`;
+            el.title = `${t.name} — click to open this person`;
+            el.innerHTML = `<span class="face-tag-name">${escapeHtml(t.name)}</span>`;
+            el.addEventListener("click", (e) => {
+                e.stopPropagation();
+                document.dispatchEvent(
+                    new CustomEvent("select-person", { detail: { groupId: t.group_id } })
+                );
+            });
+            layer.appendChild(el);
+        }
+        wrap.appendChild(layer);
+        const count = document.createElement("div");
+        count.className = "muted small";
+        count.textContent =
+            `${tags.length} tagged face${tags.length === 1 ? "" : "s"} — hover a box for the name, click it to open that person.`;
+        box.appendChild(count);
+    });
 }
