@@ -64,8 +64,9 @@
                 </div>
                 <div class="field">
                     <label for="threshold">Similarity threshold: <strong id="threshold-value">0.60</strong></label>
-                    <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
-                    <div class="range-hints"><span>Strict</span><span>Balanced</span><span>Lenient</span></div>
+                        <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
+                        <div class="range-hints"><span>Strict</span><span>Balanced</span><span>Lenient</span></div>
+                        <div class="muted small">Higher splits into more people · lower lumps similar faces together</div>
                 </div>
                 <div class="config-actions">
                     <button id="run-btn" class="btn primary"><span aria-hidden="true">▶</span> Start grouping</button>
@@ -222,6 +223,6 @@
         </div>
     </div>
 
-    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=3"></script>
+    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=4"></script>
 </body>
 </html>

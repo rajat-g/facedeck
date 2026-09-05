@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import numpy as np
 import pillow_heif
 from PIL import Image, ImageOps
 from insightface.app import FaceAnalysis
+from tqdm import tqdm
 
 
 def read_image(file_path):
@@ -60,6 +62,19 @@ def record_photo_face(conn, image_path, face_idx, face_id, bbox, img_shape, grou
 def reset_photo_faces(conn, image_path):
     """Drop stale tags for an image about to be (re)processed."""
     conn.execute("DELETE FROM photo_faces WHERE image_path=?", (str(image_path),))
+
+
+def image_face_id(img_path, face_idx):
+    """Unique face id: photo stem + hash of its folder + face index.
+
+    The folder hash disambiguates same-named photos in different folders
+    (e.g. two `DSC_001.jpg`), which previously shared one identity and
+    silently unlinked the second photo. Deterministic per file, so
+    incremental runs keep recognising their own crops.
+    """
+    parent = str(Path(img_path).resolve().parent)
+    digest = hashlib.sha1(parent.encode("utf-8")).hexdigest()[:8]
+    return f"{Path(img_path).stem}_{digest}_{face_idx}"
 
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -366,7 +381,7 @@ def main():
     id_counter = max(
         (g["id"] for g in groups if isinstance(g.get("id"), int)), default=0
     )
-    for img_path in new_files:
+    for img_path in tqdm(new_files, desc="Grouping photos", unit="photo"):
         try:
             img = read_image(str(img_path))
             if img is None:
@@ -389,7 +404,7 @@ def main():
                         max_sim = sim
                         best_group = group
 
-                face_id = f"{img_path.stem}_{face_idx}"
+                face_id = image_face_id(img_path, face_idx)
                 output_path = None
 
                 if max_sim >= args.threshold:

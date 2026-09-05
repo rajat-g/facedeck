@@ -197,7 +197,10 @@ async function loadStats() {
 
 function resetViewers() {
     state.faces = { items: [], total: 0, page: 1, visible: false, loading: false };
-    state.photos = { items: [], total: 0, page: 1, mode: state.photos.mode || "list", query: "", visible: false, loading: false };
+    // Photo list (text rows, no images) opens by default; thumbnail mode
+    // stays opt-in since it loads real images per selection.
+    const listByDefault = (state.photos.mode || "list") === "list";
+    state.photos = { items: [], total: 0, page: 1, mode: state.photos.mode || "list", query: "", visible: listByDefault, loading: false };
     state.selection.clear();
 }
 
@@ -238,6 +241,9 @@ export function selectPerson(groupId) {
     renderPeople();
     renderDetail();
     updateBulkBar();
+    // Photo list opens by default (text rows, no images). Face crops and
+    // thumbnail mode stay click-to-view. Exactly one fetch per selection.
+    if (state.photos.visible) loadPhotos(1);
     document.querySelector("#person-detail")?.scrollIntoView({ block: "nearest" });
 }
 
@@ -673,7 +679,7 @@ function renderPhotoCell(g, srcPath) {
     cell.className = "photo-cell";
     cell.title = srcPath;
     cell.innerHTML =
-        `<img src="${sourceUrl(g.id, srcPath)}" alt="${escapeHtml(name)}" loading="lazy" decoding="async">` +
+        `<img src="${sourceUrl(g.id, srcPath)}" alt="${escapeHtml(name)}" loading="lazy" decoding="async" onerror="this.style.display='none'">` +
         `<div class="photo-foot"><span>${escapeHtml(name)}</span>` +
         `<button class="mini-btn reveal" title="Reveal in Explorer">🗁</button></div>`;
     cell.addEventListener("click", (e) => {

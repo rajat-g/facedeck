@@ -4,4 +4,5 @@ insightface>=0.7.0
 pillow>=9.0.0
 pillow-heif>=0.7.0
 flask>=3.0.0
-pathlib>=1.0.1 
+tqdm>=4.60.0
+pathvalidate>=3.0.0 

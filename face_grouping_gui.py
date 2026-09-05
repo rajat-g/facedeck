@@ -19,7 +19,6 @@ class FaceGroupingApp(tk.Tk):
         self.current_db_file: str | None = None
         self.groups = []
         self.selected_group_index: int | None = None
-        self.selected_face_path: str | None = None
         self._thumb_images = []
 
         self._build_ui()
@@ -136,18 +135,6 @@ class FaceGroupingApp(tk.Tk):
             lambda e: self.thumb_canvas.configure(scrollregion=self.thumb_canvas.bbox("all")),
         )
 
-        # Face rename controls
-        face_rename_frame = ttk.Frame(right_frame)
-        face_rename_frame.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Label(face_rename_frame, text="Selected face name:").pack(side="left")
-        self.face_name_var = tk.StringVar()
-        ttk.Entry(face_rename_frame, textvariable=self.face_name_var, width=30).pack(
-            side="left", padx=(4, 4)
-        )
-        ttk.Button(
-            face_rename_frame, text="Rename face", command=self._rename_face
-        ).pack(side="left")
-
         # Log output
         log_frame = ttk.LabelFrame(right_frame, text="Log")
         log_frame.pack(fill="x", padx=4, pady=(0, 4))
@@ -194,8 +181,6 @@ class FaceGroupingApp(tk.Tk):
         for child in self.thumb_inner.winfo_children():
             child.destroy()
         self._thumb_images.clear()
-        self.selected_face_path = None
-        self.face_name_var.set("")
 
     def _show_thumbnails_for_group(self, group_index: int) -> None:
         self._clear_thumbnails()
@@ -228,10 +213,6 @@ class FaceGroupingApp(tk.Tk):
                     padding=4,
                 )
                 lbl.grid(row=idx // 4, column=idx % 4, padx=4, pady=4)
-                lbl.bind(
-                    "<Button-1>",
-                    lambda _e, p=str(img_path): self._on_face_click(p),
-                )
             except Exception as exc:  # noqa: BLE001
                 self._append_log(f"Failed to load thumbnail for {img_path}: {exc}")
 
@@ -246,10 +227,6 @@ class FaceGroupingApp(tk.Tk):
         group = self.groups[index]
         self.group_name_var.set(group.get("name") or Path(group["directory"]).name)
         self._show_thumbnails_for_group(index)
-
-    def _on_face_click(self, face_path: str) -> None:
-        self.selected_face_path = face_path
-        self.face_name_var.set(Path(face_path).stem)
 
     def _run(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
@@ -366,34 +343,6 @@ class FaceGroupingApp(tk.Tk):
             self._append_log(f"Renamed person to: {new_name}")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Error", f"Failed to rename group: {exc}")
-
-    def _rename_face(self) -> None:
-        if not self.selected_face_path:
-            messagebox.showerror("Error", "Please select a face image first.")
-            return
-
-        new_name = self.face_name_var.get().strip()
-        if not new_name:
-            messagebox.showerror("Error", "Face name cannot be empty.")
-            return
-
-        old_path = Path(self.selected_face_path)
-        new_path = old_path.with_name(new_name + old_path.suffix)
-
-        if new_path.exists():
-            messagebox.showerror(
-                "Error", "A file with this name already exists in the folder."
-            )
-            return
-
-        try:
-            old_path.rename(new_path)
-            self.selected_face_path = str(new_path)
-            self._append_log(f"Renamed face image to: {new_path.name}")
-            if self.selected_group_index is not None:
-                self._show_thumbnails_for_group(self.selected_group_index)
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Error", f"Failed to rename face image: {exc}")
 
 
 def main() -> None:

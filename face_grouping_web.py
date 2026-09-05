@@ -1,5 +1,6 @@
 import csv
 import io
+import itertools
 import json
 import os
 import platform
@@ -13,9 +14,11 @@ from pathlib import Path
 
 import cv2
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
+from pathvalidate import ValidationError, validate_filename
 
 from face_grouping_v5 import (
     cosine_similarity,
+    image_face_id,
     load_processed_state,
     open_db,
     read_image,
@@ -83,6 +86,9 @@ class RunState:
 
 run_state = RunState()
 
+# Monotonic suffix so two trash moves in the same millisecond can't collide.
+_trash_seq = itertools.count()
+
 _dialog_lock = threading.Lock()
 
 
@@ -144,6 +150,46 @@ def record_undo(conn, action, items):
         "INSERT INTO undo_log(action, details, created_at) VALUES (?, ?, ?)",
         (action, json.dumps(items), time.time()),
     )
+    # Undo history is single-level (only the latest entry is ever read);
+    # keep the table bounded instead of growing forever.
+    conn.execute(
+        "DELETE FROM undo_log WHERE id NOT IN "
+        "(SELECT id FROM undo_log ORDER BY id DESC LIMIT 50)"
+    )
+
+
+def _require_idle():
+    """409 response while a grouping run owns the database, else None.
+
+    The runner checkpoints its in-memory state over the tables, which would
+    silently discard concurrent curation. Renames and reads stay allowed
+    (checkpoints preserve names; nothing else they touch is rewritten).
+    """
+    with run_state.lock:
+        running = run_state.running
+    if running:
+        return jsonify(
+            {"error": "A grouping run is in progress — retry when it finishes"}
+        ), 409
+    return None
+
+
+def _group_name_error(name):
+    """Error string for an invalid new person/group name, else None.
+
+    Filename rules (per-platform invalid chars, reserved names, length and
+    whitespace limits) come from the well-tested `pathvalidate` library;
+    only the dot-name special cases need a hand-rolled guard.
+    """
+    if not name or not name.strip():
+        return "Group name cannot be empty"
+    if name.strip() in (".", ".."):
+        return "Group name is reserved"
+    try:
+        validate_filename(name, platform="universal")
+    except ValidationError as exc:
+        return f"Invalid group name: {exc}"
+    return None
 
 
 def next_group_number(conn, parent_dir):
@@ -295,7 +341,7 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
                             max_sim = sim
                             best_group = group
 
-                    face_id = f"{img_path.stem}_{face_idx}"
+                    face_id = image_face_id(img_path, face_idx)
                     output_path = None
 
                     if max_sim >= threshold and best_group is not None:
@@ -628,13 +674,13 @@ def api_group_photos(group_id):
         conn.close()
         return jsonify({"error": "Group not found"}), 404
     if q:
-        like = f"%{q}%"
+        like = f"%{_like_escape(q)}%"
         total = conn.execute(
-            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=? AND image_path LIKE ?",
+            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=? AND image_path LIKE ? ESCAPE '\\'",
             (group_id, like),
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT image_path FROM group_image_paths WHERE group_id=? AND image_path LIKE ? "
+            "SELECT image_path FROM group_image_paths WHERE group_id=? AND image_path LIKE ? ESCAPE '\\' "
             "ORDER BY image_path LIMIT ? OFFSET ?",
             (group_id, like, per_page, (page - 1) * per_page),
         ).fetchall()
@@ -657,6 +703,11 @@ def api_group_photos(group_id):
             "per_page": per_page,
         }
     )
+
+
+def _like_escape(text):
+    """Escape LIKE wildcards so filename filters match literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _reveal_path_on_server(target: Path):
@@ -776,7 +827,7 @@ def trash_face(conn, group_id, filename):
 
     trash_dir = Path(row["directory"]).parent / ".trash"
     trash_dir.mkdir(parents=True, exist_ok=True)
-    trash_path = trash_dir / f"{int(time.time() * 1000)}_{src.name}"
+    trash_path = trash_dir / f"{int(time.time() * 1000)}_{next(_trash_seq)}_{src.name}"
     shutil.move(str(src), str(trash_path))
 
     conn.execute(
@@ -798,6 +849,9 @@ def trash_face(conn, group_id, filename):
 
 @app.route("/api/groups/<int:group_id>/faces/<path:filename>", methods=["DELETE"])
 def api_delete_face(group_id, filename):
+    busy = _require_idle()
+    if busy:
+        return busy
     db_file = request.args.get("db_file", "processing_state.db")
     conn = open_db(db_file)
     try:
@@ -818,6 +872,9 @@ def api_delete_face(group_id, filename):
 
 @app.route("/api/faces/bulk-delete", methods=["POST"])
 def api_bulk_delete():
+    busy = _require_idle()
+    if busy:
+        return busy
     data = request.get_json(force=True)
     db_file = data.get("db_file", "processing_state.db")
     items = data.get("items") or []
@@ -850,6 +907,9 @@ def api_bulk_delete():
 
 @app.route("/api/faces/bulk-move", methods=["POST"])
 def api_bulk_move():
+    busy = _require_idle()
+    if busy:
+        return busy
     data = request.get_json(force=True)
     db_file = data.get("db_file", "processing_state.db")
     items = data.get("items") or []
@@ -872,6 +932,10 @@ def api_bulk_move():
                 return jsonify({"error": "Source group not found"}), 404
             parent = Path(first_src["directory"]).parent
             name = new_group_name
+            if name:
+                name_error = _group_name_error(name)
+                if name_error:
+                    return jsonify({"error": name_error}), 400
             if not name:
                 number = next_group_number(conn, parent)
                 name = f"group_{number}"
@@ -974,6 +1038,9 @@ def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
 
 @app.route("/api/undo", methods=["POST"])
 def api_undo():
+    busy = _require_idle()
+    if busy:
+        return busy
     data = request.get_json(force=True)
     db_file = data.get("db_file", "processing_state.db")
 
@@ -1029,6 +1096,7 @@ def undo_item(conn, item):
     dst_path = Path(item["dst_path"])
     src_path = Path(item["src_path"])
     if dst_path.exists():
+        src_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(dst_path), str(src_path))
     conn.execute(
         "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
@@ -1045,74 +1113,6 @@ def undo_item(conn, item):
     return f"moved {src_path.name} back"
 
 
-@app.route("/api/faces/move", methods=["POST"])
-def api_move_face():
-    data = request.get_json(force=True)
-    db_file = data.get("db_file", "processing_state.db")
-    group_id = int(data.get("group_id"))
-    filename = Path(data.get("filename")).name
-    target_id = data.get("target_group_id")
-    new_group_name = (data.get("new_group_name") or "").strip()
-
-    conn = open_db(db_file)
-    try:
-        src = conn.execute(
-            "SELECT directory FROM groups WHERE id=?", (group_id,)
-        ).fetchone()
-        if src is None:
-            return jsonify({"error": "Source group not found"}), 404
-
-        if target_id in (None, "", -1):
-            if any(ch in new_group_name for ch in '\\/:*?"<>|'):
-                return jsonify({"error": "New group name has invalid characters"}), 400
-            parent = Path(src["directory"]).parent
-            if new_group_name:
-                if (parent / new_group_name).exists():
-                    return jsonify(
-                        {"error": "A folder with this name already exists"}
-                    ), 400
-                name = new_group_name
-            else:
-                number = next_group_number(conn, parent)
-                name = f"group_{number}"
-                while (parent / name).exists():
-                    number += 1
-                    name = f"group_{number}"
-            dst_dir = parent / name
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            target_id = next_group_id(conn)
-            conn.execute(
-                "INSERT INTO groups(id, sum_embedding, count, directory) VALUES (?, '', 0, ?)",
-                (target_id, str(dst_dir)),
-            )
-        else:
-            target_id = int(target_id)
-            dst_row = conn.execute(
-                "SELECT directory FROM groups WHERE id=?", (target_id,)
-            ).fetchone()
-            if dst_row is None:
-                return jsonify({"error": "Target group not found"}), 404
-            dst_dir = Path(dst_row["directory"])
-
-        try:
-            undo_item = move_single_face(conn, group_id, filename, dst_dir, target_id)
-        except (LookupError, FileNotFoundError) as exc:
-            conn.rollback()
-            return jsonify({"error": str(exc)}), 404
-        except FileExistsError as exc:
-            conn.rollback()
-            return jsonify({"error": str(exc)}), 400
-        except OSError as exc:
-            conn.rollback()
-            return jsonify({"error": f"Move failed: {exc}"}), 500
-
-        record_undo(conn, "move", [undo_item])
-        conn.commit()
-        return jsonify({"ok": True, "target_group_id": target_id})
-    finally:
-        conn.close()
-
-
 @app.route("/api/stats")
 def api_stats():
     db_file = request.args.get("db_file", "processing_state.db")
@@ -1121,8 +1121,10 @@ def api_stats():
 
     conn = open_db(db_file)
     total_groups = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+    # Count crops actually on record (embedding counts survive Approve,
+    # which deletes the crops — summing them would inflate the chip).
     total_faces = conn.execute(
-        "SELECT COALESCE(SUM(count), 0) FROM groups"
+        "SELECT COUNT(*) FROM group_cropped_faces"
     ).fetchone()[0]
     photos = conn.execute("SELECT COUNT(*) FROM processed_files").fetchone()[0]
     largest = [
@@ -1397,6 +1399,9 @@ def _approve_group_crops(conn, group_id):
 
 @app.route("/api/groups/<int:group_id>/approve", methods=["POST"])
 def api_approve_group(group_id):
+    busy = _require_idle()
+    if busy:
+        return busy
     data = request.get_json(force=True) if request.data else {}
     db_file = (data.get("db_file") or request.args.get("db_file") or "processing_state.db").strip() or "processing_state.db"
     if not Path(db_file).exists():
@@ -1418,6 +1423,9 @@ def api_approve_group(group_id):
 
 @app.route("/api/groups/approve-all", methods=["POST"])
 def api_approve_all():
+    busy = _require_idle()
+    if busy:
+        return busy
     data = request.get_json(force=True) if request.data else {}
     db_file = (data.get("db_file") or request.args.get("db_file") or "processing_state.db").strip() or "processing_state.db"
     if not Path(db_file).exists():

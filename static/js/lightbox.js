@@ -162,7 +162,9 @@ function loadFaceTags(lb, srcPath, box) {
     // Clear any overlay from the previous photo immediately.
     document.querySelector("#lightbox-imgwrap .tag-layer")?.remove();
     fetchTags(lb.groupId, srcPath).then((tags) => {
-        if (state.lightbox !== lb) return; // user already moved on
+        // Guard on identity AND photo: navigation mutates the same object,
+        // so a slow earlier fetch must not paint over a newer photo.
+        if (state.lightbox !== lb || lb.items[lb.index] !== srcPath) return;
         if (tags.length === 0) {
             const note = document.createElement("div");
             note.className = "muted small";

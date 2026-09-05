@@ -51,11 +51,13 @@ The web UI lets you:
   and warns about a brand-new database or input folders that differ from the
   database's last run (groups belong to the DB, not the folder)
 - Browse people as a fast list (no images loaded up front — safe for thousands of photos)
-- Select a person to see counts, then explicitly choose per section:
+- Select a person to see counts: the source-photo list opens automatically
+  (text rows, zero images), while face crops stay click-to-view. Thumbs mode
+  stays click-to-view too, since it loads real images
   - Face crops: click "View on UI" for a paginated, lazy-loaded grid, or keep previews off
-  - Source photos: List mode shows filenames with zero images, Thumbs mode loads one page at a time,
-    and every photo has Preview (single-image viewer) plus Reveal (opens Explorer on the server);
-    "Open folder" reveals the whole group folder without loading anything in the browser
+  - Every photo has Preview (single-image viewer) plus Reveal (opens Explorer
+    on the server); "Open folder" reveals the whole group folder without
+    loading anything in the browser
 - Name people (stored in the database) shown on group cards
 - View a face in a lightbox together with the source photo(s) it came from
 - Face tags on source photos: hover boxes with names (Facebook-style), click a tag to open that person
@@ -100,6 +102,11 @@ Face tags are recorded during grouping (normalised boxes + owning group per face
 Tags follow renames and moves, survive "approve", and are hidden for trashed faces.
 Photos processed before tagging show no boxes until re-processed.
 EXIF orientation is normalised at detection and serving time so boxes land correctly.
+
+Face IDs embed a short hash of the photo's folder, so same-named photos in
+different folders no longer share an identity. Databases and output folders
+created before this change use the old `stem_index` format — rebuild them
+from scratch (fresh `.db` + fresh faces folder, then re-run).
 
 ## Notes
 

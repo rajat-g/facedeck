@@ -18,7 +18,7 @@ export const state = {
     lastSelectedKey: null,
     // per-person viewers (opt-in, paginated)
     faces: { items: [], total: 0, page: 1, visible: false, loading: false },
-    photos: { items: [], total: 0, page: 1, mode: "list", query: "", visible: false, loading: false },
+    photos: { items: [], total: 0, page: 1, mode: "list", query: "", visible: true, loading: false },
     lightbox: null, // {kind:'face'|'source', groupId, groupName, items, index}
     moveContext: null,
     pollTimer: null,
@@ -52,7 +52,9 @@ export async function api(path, options = {}) {
 export function escapeHtml(text) {
     const div = document.createElement("div");
     div.textContent = text == null ? "" : String(text);
-    return div.innerHTML;
+    // innerHTML escapes &<> but NOT quotes — escape those too since values
+    // land in double-quoted attributes (titles, alt text).
+    return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 export function dirname(path) {
@@ -113,8 +115,11 @@ export function loadSettings() {
     const theme = saved.theme || "dark";
     document.documentElement.dataset.theme = theme;
     $("#theme-btn").textContent = theme === "dark" ? "☾" : "☀";
-    $("#config-panel").classList.toggle("collapsed", saved.configCollapsed !== false);
-    $("#config-toggle").setAttribute("aria-expanded", saved.configCollapsed !== false ? "false" : "true");
+    // Collapse only when the user explicitly collapsed before; first-timers
+    // get an open Setup panel instead of an empty list with a hidden door.
+    const collapsed = saved.configCollapsed === true;
+    $("#config-panel").classList.toggle("collapsed", collapsed);
+    $("#config-toggle").setAttribute("aria-expanded", collapsed ? "false" : "true");
     if (saved.photosMode === "thumbs") state.photos.mode = "thumbs";
 }
 

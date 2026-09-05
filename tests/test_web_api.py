@@ -70,8 +70,15 @@ class WebApiTestCase(unittest.TestCase):
     def test_stats(self):
         stats = self.client.get(f"/api/stats?{self.q}").get_json()
         self.assertEqual(stats["groups"], 2)
-        self.assertEqual(stats["faces"], 2, "sum of group embedding counts")
+        self.assertEqual(stats["faces"], 3, "crops actually on record")
         self.assertEqual(stats["largest"][0]["count"], 2)
+
+    def test_stats_ignores_approved_away_crops(self):
+        for name in ("a_0.jpg", "b_0.jpg"):
+            resp = self.client.delete(f"/api/groups/1/faces/{name}?{self.q}")
+            self.assertEqual(resp.status_code, 200)
+        stats = self.client.get(f"/api/stats?{self.q}").get_json()
+        self.assertEqual(stats["faces"], 1)
 
     def test_export_csv_and_json(self):
         csv_resp = self.client.get(f"/api/export?format=csv&{self.q}")
@@ -119,15 +126,15 @@ class WebApiTestCase(unittest.TestCase):
 
     def test_move_and_undo(self):
         resp = self.client.post(
-            "/api/faces/move",
+            "/api/faces/bulk-move",
             json={
-                "group_id": 1,
-                "filename": "b_0.jpg",
+                "items": [{"group_id": 1, "filename": "b_0.jpg"}],
                 "target_group_id": 2,
                 "db_file": str(self.db_file),
             },
         )
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["moved"], 1)
         self.assertFalse((self.g1 / "b_0.jpg").exists())
         self.assertTrue((self.g2 / "b_0.jpg").exists())
 
@@ -147,10 +154,9 @@ class WebApiTestCase(unittest.TestCase):
 
     def test_move_to_new_named_group(self):
         resp = self.client.post(
-            "/api/faces/move",
+            "/api/faces/bulk-move",
             json={
-                "group_id": 1,
-                "filename": "b_0.jpg",
+                "items": [{"group_id": 1, "filename": "b_0.jpg"}],
                 "target_group_id": -1,
                 "new_group_name": "Carol",
                 "db_file": str(self.db_file),
@@ -162,16 +168,43 @@ class WebApiTestCase(unittest.TestCase):
 
     def test_move_existing_name_conflict(self):
         resp = self.client.post(
-            "/api/faces/move",
+            "/api/faces/bulk-move",
             json={
-                "group_id": 1,
-                "filename": "b_0.jpg",
+                "items": [{"group_id": 1, "filename": "b_0.jpg"}],
                 "target_group_id": -1,
                 "new_group_name": "group_2",
                 "db_file": str(self.db_file),
             },
         )
         self.assertEqual(resp.status_code, 400)
+
+    def test_move_rejects_reserved_and_malformed_names(self):
+        for bad in ("..", ".", "a/b", 'a"b', "trailing. "):
+            resp = self.client.post(
+                "/api/faces/bulk-move",
+                json={
+                    "items": [{"group_id": 1, "filename": "b_0.jpg"}],
+                    "target_group_id": -1,
+                    "new_group_name": bad,
+                    "db_file": str(self.db_file),
+                },
+            )
+            self.assertEqual(resp.status_code, 400, bad)
+        # Nothing moved.
+        self.assertTrue((self.g1 / "b_0.jpg").exists())
+
+    def test_move_trims_surrounding_whitespace(self):
+        resp = self.client.post(
+            "/api/faces/bulk-move",
+            json={
+                "items": [{"group_id": 1, "filename": "b_0.jpg"}],
+                "target_group_id": -1,
+                "new_group_name": "  Carol  ",
+                "db_file": str(self.db_file),
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue((self.out_root / "Carol" / "b_0.jpg").exists())
 
     # ---------- bulk ops ----------
 
@@ -330,10 +363,9 @@ class PhotoTagsTestCase(unittest.TestCase):
 
     def test_tags_follow_move(self):
         resp = self.client.post(
-            "/api/faces/move",
+            "/api/faces/bulk-move",
             json={
-                "group_id": 1,
-                "filename": "p1_0.jpg",
+                "items": [{"group_id": 1, "filename": "p1_0.jpg"}],
                 "target_group_id": 2,
                 "db_file": str(self.db_file),
             },
@@ -542,6 +574,175 @@ class StreamingTestCase(unittest.TestCase):
             self.assertEqual(timeout, 10000)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class RunGuardTestCase(unittest.TestCase):
+    """Mutations are rejected (409) while a grouping run owns the database."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-guard-"))
+        self.db_file = self.tmp / "state.db"
+        self.g1 = self.tmp / "out" / "group_1"
+        self.g1.mkdir(parents=True)
+        make_face_file(self.g1, "a_0.jpg")
+        conn = open_db(str(self.db_file))
+        conn.execute(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (1, '', 1, ?, 'Alice')",
+            (str(self.g1),),
+        )
+        conn.execute("INSERT INTO group_cropped_faces VALUES (1, 'a_0')")
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+        from face_grouping_web import run_state
+
+        self._run_state = run_state
+        run_state.reset()  # simulate an active run
+
+    def tearDown(self):
+        with self._run_state.lock:
+            self._run_state.running = False
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_mutations_rejected_while_running(self):
+        db = {"db_file": str(self.db_file)}
+        self.assertEqual(
+            self.client.post("/api/faces/bulk-delete",
+                             json={"items": [{"group_id": 1, "filename": "a_0.jpg"}], **db}).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post("/api/faces/bulk-move",
+                             json={"items": [{"group_id": 1, "filename": "a_0.jpg"}],
+                                   "target_group_id": -1, **db}).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.delete(f"/api/groups/1/faces/a_0.jpg?{self.q}").status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post("/api/groups/1/approve", json=db).status_code, 409
+        )
+        self.assertEqual(
+            self.client.post("/api/groups/approve-all", json=db).status_code, 409
+        )
+        self.assertEqual(
+            self.client.post("/api/undo", json=db).status_code, 409
+        )
+        # The face is untouched and renames (safe) still work.
+        self.assertTrue((self.g1 / "a_0.jpg").exists())
+        self.assertEqual(
+            self.client.post("/api/groups/1/rename",
+                             json={"name": "Alicia", **db}).status_code,
+            200,
+        )
+
+    def test_mutations_allowed_when_idle(self):
+        with self._run_state.lock:
+            self._run_state.running = False
+        db = {"db_file": str(self.db_file)}
+        self.assertEqual(
+            self.client.post("/api/faces/bulk-delete",
+                             json={"items": [{"group_id": 1, "filename": "a_0.jpg"}], **db}).status_code,
+            200,
+        )
+
+
+class PhotoSearchEscapeTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-like-"))
+        self.db_file = self.tmp / "state.db"
+        conn = open_db(str(self.db_file))
+        conn.execute(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (1, '', 1, 'C:/x/g1', 'Alice')"
+        )
+        conn.executemany(
+            "INSERT INTO group_image_paths VALUES (1, ?)",
+            [("C:/p/a%b.jpg",), ("C:/p/a_b.jpg",), ("C:/p/axb.jpg",)],
+        )
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def photos(self, q):
+        return self.client.get(
+            f"/api/groups/1/photos?{self.q}&q={q}").get_json()["photos"]
+
+    def test_percent_is_literal(self):
+        self.assertEqual(self.photos("a%b"), ["C:/p/a%b.jpg"])
+
+    def test_underscore_is_literal(self):
+        self.assertEqual(self.photos("a_b"), ["C:/p/a_b.jpg"])
+
+
+class TrashAndUndoEdgeTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-edge-"))
+        self.db_file = self.tmp / "state.db"
+        self.out_root = self.tmp / "out"
+        self.g1 = self.out_root / "group_1"
+        self.g2 = self.out_root / "group_2"
+        self.g1.mkdir(parents=True)
+        self.g2.mkdir(parents=True)
+        for name in ("a_0.jpg", "b_0.jpg"):
+            make_face_file(self.g1, name)
+        make_face_file(self.g2, "c_0.jpg")
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, '', 1, ?, ?)",
+            [(1, str(self.g1), "Alice"), (2, str(self.g2), "Bob")],
+        )
+        conn.executemany(
+            "INSERT INTO group_cropped_faces VALUES (?, ?)",
+            [(1, "a_0"), (1, "b_0"), (2, "c_0")],
+        )
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+        self.db = {"db_file": str(self.db_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rapid_deletes_keep_distinct_trash_files(self):
+        resp = self.client.post(
+            "/api/faces/bulk-delete",
+            json={"items": [{"group_id": 1, "filename": "a_0.jpg"},
+                            {"group_id": 1, "filename": "b_0.jpg"}],
+                  **self.db},
+        )
+        self.assertEqual(resp.status_code, 200)
+        trashed = list((self.out_root / ".trash").glob("*"))
+        self.assertEqual(len(trashed), 2, "same-ms deletes must not collide")
+        undo = self.client.post("/api/undo", json=self.db)
+        self.assertEqual(undo.status_code, 200)
+        self.assertTrue((self.g1 / "a_0.jpg").exists())
+        self.assertTrue((self.g1 / "b_0.jpg").exists())
+
+    def test_move_undo_recreates_missing_source_dir(self):
+        resp = self.client.post(
+            "/api/faces/bulk-move",
+            json={"items": [{"group_id": 1, "filename": "a_0.jpg"}],
+                  "target_group_id": 2, **self.db},
+        )
+        self.assertEqual(resp.status_code, 200)
+        shutil.rmtree(self.g1)  # e.g. approved away after the move
+        undo = self.client.post("/api/undo", json=self.db)
+        self.assertEqual(undo.status_code, 200)
+        self.assertTrue((self.g1 / "a_0.jpg").exists())
 
 
 if __name__ == "__main__":
