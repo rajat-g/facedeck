@@ -25,3 +25,9 @@ export function toast(message, type = "info", timeoutMs = 3500) {
 
 export const toastError = (msg) => toast(msg, "error");
 export const toastSuccess = (msg) => toast(msg, "success");
+
+/* Suffix for move toasts: how many source photos followed their faces. */
+export function photosSuffix(result) {
+    const n = new Set((result.photos || []).map((p) => p.photo)).size;
+    return n ? ` ${n} photo(s) linked here too.` : "";
+}

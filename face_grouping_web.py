@@ -350,6 +350,11 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
                                 conn, str(img_path), face_idx, face_id,
                                 face.bbox, img.shape, best_group["id"],
                             )
+                            conn.execute(
+                                "INSERT OR IGNORE INTO group_image_paths(group_id, image_path) "
+                                "VALUES (?, ?)",
+                                (best_group["id"], str(img_path)),
+                            )
                             continue
                         best_group["sum_embedding"] += embedding
                         best_group["count"] += 1
@@ -839,11 +844,23 @@ def trash_face(conn, group_id, filename):
         "UPDATE photo_faces SET detached=1 WHERE face_id=?",
         (src.stem,),
     )
+    # Recompute the source photo's links: it drops out of this group when
+    # none of its faces remain here.
+    trashed_photos = []
+    for photo in photo_paths_for_face(conn, src.stem):
+        if relink_photo(conn, photo):
+            still = conn.execute(
+                "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
+                (group_id, photo),
+            ).fetchone()
+            trashed_photos.append({"filename": filename, "photo": photo,
+                                   "unlinked_source": not still})
     return {
         "face_path": str(src),
         "trash_path": str(trash_path),
         "group_id": group_id,
         "face_id": src.stem,
+        "photos": trashed_photos,
     }
 
 
@@ -856,9 +873,10 @@ def api_delete_face(group_id, filename):
     conn = open_db(db_file)
     try:
         item = trash_face(conn, group_id, filename)
+        photos = item.pop("photos", [])
         record_undo(conn, "delete", [item])
         conn.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "photos": photos})
     except LookupError as exc:
         return jsonify({"error": str(exc)}), 404
     except FileNotFoundError as exc:
@@ -866,6 +884,87 @@ def api_delete_face(group_id, filename):
     except OSError as exc:
         conn.rollback()
         return jsonify({"error": f"Delete failed: {exc}"}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/groups/<int:group_id>", methods=["DELETE"])
+def api_delete_group(group_id):
+    """Delete an EMPTY group (no faces, no photos). Refuses otherwise."""
+    busy = _require_idle()
+    if busy:
+        return busy
+    db_file = request.args.get("db_file", "processing_state.db")
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        row = conn.execute(
+            "SELECT directory, name FROM groups WHERE id=?", (group_id,)
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Group not found"}), 404
+        faces = conn.execute(
+            "SELECT COUNT(*) FROM group_cropped_faces WHERE group_id=?",
+            (group_id,),
+        ).fetchone()[0]
+        photos = conn.execute(
+            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=?",
+            (group_id,),
+        ).fetchone()[0]
+        directory = Path(row["directory"])
+        stray = []
+        if directory.is_dir():
+            stray = [
+                p.name for p in directory.iterdir()
+                if p.is_file() and p.suffix.lower() in FACE_EXTENSIONS
+            ]
+        if faces or photos or stray:
+            return jsonify(
+                {"error": "Group is not empty — move, delete or approve its contents first"}
+            ), 400
+        grow = conn.execute(
+            "SELECT sum_embedding, count, directory, name FROM groups WHERE id=?",
+            (group_id,),
+        ).fetchone()
+        stale_tags = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached "
+                "FROM photo_faces WHERE group_id=? AND face_id NOT IN "
+                "(SELECT face_id FROM group_cropped_faces)",
+                (group_id,),
+            )
+        ]
+        conn.execute("DELETE FROM group_image_paths WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM group_cropped_faces WHERE group_id=?", (group_id,))
+        if stale_tags:
+            conn.execute(
+                "DELETE FROM photo_faces WHERE group_id=? AND face_id NOT IN "
+                "(SELECT face_id FROM group_cropped_faces)",
+                (group_id,),
+            )
+        conn.execute("DELETE FROM groups WHERE id=?", (group_id,))
+        dir_removed = False
+        if directory.is_dir():
+            try:
+                if not any(directory.iterdir()):
+                    directory.rmdir()
+                    dir_removed = True
+            except OSError:
+                pass
+        record_undo(conn, "delete-group", [{
+            "group": {
+                "id": group_id,
+                "sum_embedding": grow["sum_embedding"],
+                "count": grow["count"],
+                "directory": grow["directory"],
+                "name": grow["name"],
+            },
+            "tags": stale_tags,
+        }])
+        conn.commit()
+        return jsonify({"ok": True, "dir_removed": dir_removed})
     finally:
         conn.close()
 
@@ -882,13 +981,15 @@ def api_bulk_delete():
         return jsonify({"error": "No faces selected"}), 400
 
     conn = open_db(db_file)
-    deleted, errors = [], []
+    deleted, errors, photos = [], [], []
     try:
         for item in items:
             try:
                 group_id = int(item["group_id"])
                 filename = Path(item["filename"]).name
-                deleted.append(trash_face(conn, group_id, filename))
+                trashed = trash_face(conn, group_id, filename)
+                deleted.append(trashed)
+                photos.extend(trashed.pop("photos", []))
             except (LookupError, FileNotFoundError) as exc:
                 errors.append(f"{item.get('filename')}: {exc}")
             except OSError as exc:
@@ -900,7 +1001,8 @@ def api_bulk_delete():
         else:
             conn.rollback()
             return jsonify({"error": "; ".join(errors)}), 400
-        return jsonify({"ok": True, "deleted": len(deleted), "errors": errors})
+        return jsonify({"ok": True, "deleted": len(deleted), "errors": errors,
+                        "photos": photos})
     finally:
         conn.close()
 
@@ -919,7 +1021,7 @@ def api_bulk_move():
         return jsonify({"error": "No faces selected"}), 400
 
     conn = open_db(db_file)
-    moved, errors = [], []
+    moved, errors, photos = [], [], []
     try:
         # Resolve/create the destination directory once
         dst_dir = None
@@ -972,6 +1074,7 @@ def api_bulk_move():
                 )
                 if undo_item:
                     moved.append(undo_item)
+                    photos.extend(undo_item.pop("photos", []))
             except (LookupError, FileNotFoundError) as exc:
                 errors.append(f"{item.get('filename')}: {exc}")
             except OSError as exc:
@@ -990,10 +1093,58 @@ def api_bulk_move():
                 "moved": len(moved),
                 "target_group_id": dst_group_id,
                 "errors": errors,
+                "photos": photos,
+                "photos": photos,
             }
         )
     finally:
         conn.close()
+
+
+def photo_paths_for_face(conn, face_id):
+    """Source photo(s) recorded for a face crop. Empty when unknown
+    (e.g. data processed before face tags existed)."""
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT image_path FROM photo_faces WHERE face_id=?",
+            (face_id,),
+        )
+    ]
+
+
+def relink_photo(conn, image_path):
+    """Link a photo to exactly the groups owning its live faces.
+
+    A photo stays linked to a group while at least one non-detached face
+    belongs to it (approved groups resolve through their stored group, so
+    approving never unlinks photos). Returns True when links were
+    recomputed, False when the photo has no tag rows and was left alone.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM photo_faces WHERE image_path=?", (image_path,)
+    ).fetchone():
+        return False
+    rows = conn.execute(
+        "SELECT DISTINCT COALESCE(cf.group_id, pf.group_id) AS gid "
+        "FROM photo_faces pf "
+        "LEFT JOIN group_cropped_faces cf ON cf.face_id = pf.face_id "
+        "WHERE pf.image_path=? AND pf.detached=0",
+        (image_path,),
+    ).fetchall()
+    gids = set()
+    for (gid,) in rows:
+        if gid is not None and conn.execute(
+            "SELECT 1 FROM groups WHERE id=?", (gid,)
+        ).fetchone():
+            gids.add(gid)
+    conn.execute("DELETE FROM group_image_paths WHERE image_path=?", (image_path,))
+    for gid in gids:
+        conn.execute(
+            "INSERT OR IGNORE INTO group_image_paths(group_id, image_path) VALUES (?, ?)",
+            (gid, image_path),
+        )
+    return True
 
 
 def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
@@ -1027,12 +1178,24 @@ def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
         "UPDATE photo_faces SET group_id=?, detached=0 WHERE face_id=?",
         (dst_group_id, face_id),
     )
+    # The source photo follows its face: link it to the new group, and drop
+    # it from the old one only when none of its faces remain there.
+    moved_photos = []
+    for photo in photo_paths_for_face(conn, face_id):
+        if relink_photo(conn, photo):
+            still = conn.execute(
+                "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
+                (group_id, photo),
+            ).fetchone()
+            moved_photos.append({"filename": filename, "photo": photo,
+                                 "unlinked_source": not still})
     return {
         "src_path": str(src_path),
         "dst_path": str(dst_path),
         "src_group_id": group_id,
         "dst_group_id": dst_group_id,
         "face_id": face_id,
+        "photos": moved_photos,
     }
 
 
@@ -1073,7 +1236,34 @@ def api_undo():
 
 
 def undo_item(conn, item):
-    """Reverse a single delete/move item. Returns a short description."""
+    """Reverse a single delete/move/group-delete item. Returns a short description."""
+    if "group" in item:
+        # Undo of an empty-group delete: re-create the row and its tags.
+        g = item["group"]
+        Path(g["directory"]).mkdir(parents=True, exist_ok=True)
+        try:
+            conn.execute(
+                "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (g["id"], g["sum_embedding"], g["count"], g["directory"], g["name"]),
+            )
+            group_id = g["id"]
+        except sqlite3.IntegrityError:
+            group_id = next_group_id(conn)
+            conn.execute(
+                "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (group_id, g["sum_embedding"], g["count"], g["directory"], g["name"]),
+            )
+        for t in item.get("tags", []):
+            conn.execute(
+                "INSERT OR IGNORE INTO photo_faces(image_path, face_idx, face_id, "
+                "x1, y1, x2, y2, group_id, detached) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (t["image_path"], t["face_idx"], t["face_id"], t["x1"], t["y1"],
+                 t["x2"], t["y2"], group_id, t.get("detached", 0)),
+            )
+        return f"restored group {g['name']}"
     if "trash_path" in item:
         # Undo of a delete: restore from trash and re-register the face
         trash_path = Path(item["trash_path"])
@@ -1090,6 +1280,8 @@ def undo_item(conn, item):
             "UPDATE photo_faces SET detached=0 WHERE face_id=?",
             (item["face_id"],),
         )
+        for photo in photo_paths_for_face(conn, item["face_id"]):
+            relink_photo(conn, photo)
         return f"restored {face_path.name}"
 
     # Undo of a move: put the file back into the source group
@@ -1110,6 +1302,8 @@ def undo_item(conn, item):
         "UPDATE photo_faces SET group_id=? WHERE face_id=?",
         (item["src_group_id"], item["face_id"]),
     )
+    for photo in photo_paths_for_face(conn, item["face_id"]):
+        relink_photo(conn, photo)
     return f"moved {src_path.name} back"
 
 

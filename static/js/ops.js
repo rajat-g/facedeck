@@ -71,11 +71,21 @@ export async function approveGroup(groupId) {
 export async function approveAllGroups() {
     if (blockedByRun()) return null;
     try {
-        return await api("/api/groups/approve-all", {
+        return await api(`/api/groups/approve-all`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ db_file: getDbFile() }),
         });
+    } catch (err) { toastError(err.message); return null; }
+}
+
+export async function deleteGroup(groupId) {
+    if (blockedByRun()) return null;
+    try {
+        return await api(
+            `/api/groups/${groupId}?db_file=${encodeURIComponent(getDbFile())}`,
+            { method: "DELETE" },
+        );
     } catch (err) { toastError(err.message); return null; }
 }
 

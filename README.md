@@ -62,7 +62,11 @@ The web UI lets you:
 - View a face in a lightbox together with the source photo(s) it came from
 - Face tags on source photos: hover boxes with names (Facebook-style), click a tag to open that person
 - Remove incorrect/unwanted faces (moved to a `.trash` folder) and undo moves/deletes
-- Select multiple faces (Ctrl-click / Shift-click) or drag-and-drop them between groups
+- Delete fully empty groups (no faces, no photos) from the detail panel, with undo
+- Select multiple faces (Ctrl-click / Shift-click) or drag-and-drop them between groups.
+  Moving a crop also moves its source photo's group link (via face tags);
+  a photo leaves its old group only when none of its faces remain there.
+  Deleting a crop unlinks its photo the same way. Approve keeps photos listed
 - Copy all source photo paths of a group to the clipboard
 - See stats (photos processed, faces, largest groups)
 - Export groups as CSV or JSON

@@ -414,7 +414,8 @@ body.is-running #bulk-bar { display: none !important; }
 body.is-running .tile-btns { opacity: 0 !important; pointer-events: none !important; }
 body.is-running .approve-one,
 body.is-running #approve-all-btn,
-body.is-running #undo-btn { opacity: 0.45; pointer-events: none; }
+body.is-running #undo-btn,
+body.is-running .delete-group { opacity: 0.45; pointer-events: none; }
 
 /* Overlays / dialogs / viewer */
 .overlay {

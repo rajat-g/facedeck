@@ -414,6 +414,12 @@ def main():
                             conn, str(img_path), face_idx, face_id,
                             face.bbox, img.shape, best_group.get("id"),
                         )
+                        if best_group.get("id") is not None:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO group_image_paths(group_id, image_path) "
+                                "VALUES (?, ?)",
+                                (best_group.get("id"), str(img_path)),
+                            )
                         continue
 
                     best_group['sum_embedding'] += embedding

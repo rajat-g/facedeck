@@ -2,7 +2,7 @@
 
 import { $, faceUrl, state } from "./core.js";
 import { moveFaces } from "./ops.js";
-import { toastError, toastSuccess } from "./toast.js";
+import { photosSuffix, toastError, toastSuccess } from "./toast.js";
 
 let refresh = () => {};
 
@@ -74,6 +74,6 @@ async function confirmMove() {
     );
     if (!result) return;
     closeMoveModal();
-    toastSuccess(`Moved ${result.moved} face(s).`);
+    toastSuccess(`Moved ${result.moved} face(s).` + photosSuffix(result));
     refresh();
 }

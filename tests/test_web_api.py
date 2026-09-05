@@ -376,11 +376,14 @@ class PhotoTagsTestCase(unittest.TestCase):
         self.assertEqual(by_face["p1_0"]["name"], "Bob")
         self.assertEqual(by_face["p1_0"]["group_id"], 2)
 
-    def test_delete_hides_tag_and_undo_restores(self):
+    def test_delete_unlinks_photo_and_undo_restores(self):
         resp = self.client.delete(f"/api/groups/1/faces/p2_0.jpg?{self.q}")
         self.assertEqual(resp.status_code, 200)
-        tags = self.get_tags(1, "C:/photos/p2.jpg").get_json()["tags"]
-        self.assertEqual(tags, [])
+        # p2.jpg had no other live faces, so it drops out of the group.
+        self.assertEqual(self.get_tags(1, "C:/photos/p2.jpg").status_code, 404)
+        groups = {g["id"]: g for g in
+                  self.client.get(f"/api/groups?{self.q}").get_json()["groups"]}
+        self.assertNotIn("C:/photos/p2.jpg", groups[1]["image_paths"])
 
         undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
         self.assertEqual(undo.status_code, 200)
@@ -633,6 +636,9 @@ class RunGuardTestCase(unittest.TestCase):
         self.assertEqual(
             self.client.post("/api/undo", json=db).status_code, 409
         )
+        self.assertEqual(
+            self.client.delete(f"/api/groups/1?{self.q}").status_code, 409
+        )
         # The face is untouched and renames (safe) still work.
         self.assertTrue((self.g1 / "a_0.jpg").exists())
         self.assertEqual(
@@ -743,6 +749,184 @@ class TrashAndUndoEdgeTestCase(unittest.TestCase):
         undo = self.client.post("/api/undo", json=self.db)
         self.assertEqual(undo.status_code, 200)
         self.assertTrue((self.g1 / "a_0.jpg").exists())
+
+
+class EmptyGroupDeleteTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-empty-"))
+        self.db_file = self.tmp / "state.db"
+        self.out_root = self.tmp / "out"
+        self.g1 = self.out_root / "group_1"
+        self.g1.mkdir(parents=True)
+        make_face_file(self.g1, "a_0.jpg")
+        self.g2 = self.out_root / "group_2"
+        self.g2.mkdir(parents=True)  # exists but empty
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, '', ?, ?, ?)",
+            [(1, 1, str(self.g1), "Alice"), (2, 0, str(self.g2), None)],
+        )
+        conn.execute("INSERT INTO group_image_paths VALUES (1, 'C:/p/a.jpg')")
+        conn.execute("INSERT INTO group_cropped_faces VALUES (1, 'a_0')")
+        # Stale tag fallback pointing at the empty group (approved long ago).
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES ('C:/p/a.jpg', 7, 'zzz_0', 0.1, 0.1, 0.2, 0.2, 2, 0)"
+        )
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+        self.db = {"db_file": str(self.db_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_delete_empty_group_removes_row_and_dir(self):
+        resp = self.client.delete(f"/api/groups/2?{self.q}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["dir_removed"])
+        self.assertFalse(self.g2.exists())
+        groups = self.client.get(f"/api/groups?{self.q}").get_json()["groups"]
+        self.assertEqual([g["id"] for g in groups], [1])
+        # Stale fallback tags cleaned up.
+        left = open_db(str(self.db_file)).execute(
+            "SELECT COUNT(*) FROM photo_faces WHERE face_id='zzz_0'").fetchone()[0]
+        self.assertEqual(left, 0)
+
+    def test_delete_then_undo_restores_group(self):
+        self.assertEqual(self.client.delete(f"/api/groups/2?{self.q}").status_code, 200)
+        undo = self.client.post("/api/undo", json=self.db)
+        self.assertEqual(undo.status_code, 200)
+        groups = {g["id"]: g for g in
+                  self.client.get(f"/api/groups?{self.q}").get_json()["groups"]}
+        self.assertEqual(groups[2]["name"], "group_2")
+        self.assertTrue(self.g2.is_dir())
+        left = open_db(str(self.db_file)).execute(
+            "SELECT COUNT(*) FROM photo_faces WHERE face_id='zzz_0'").fetchone()[0]
+        self.assertEqual(left, 1)
+
+    def test_delete_refuses_nonempty_and_missing(self):
+        self.assertEqual(self.client.delete(f"/api/groups/1?{self.q}").status_code, 400)
+        self.assertEqual(self.client.delete(f"/api/groups/99?{self.q}").status_code, 404)
+        # Photos alone (approved-like) also refuse.
+        conn = open_db(str(self.db_file))
+        conn.execute("INSERT INTO group_image_paths VALUES (2, 'C:/p/z.jpg')")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.client.delete(f"/api/groups/2?{self.q}").status_code, 400)
+
+
+class PhotoFollowTestCase(unittest.TestCase):
+    """Moving/deleting a crop re-links its source photo via face tags."""
+
+    P1 = "C:/photos/p1.jpg"
+    P2 = "C:/photos/p2.jpg"
+    P3 = "C:/photos/p3.jpg"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-follow-"))
+        self.db_file = self.tmp / "state.db"
+        self.out_root = self.tmp / "out"
+        self.g1 = self.out_root / "group_1"
+        self.g2 = self.out_root / "group_2"
+        self.g1.mkdir(parents=True)
+        self.g2.mkdir(parents=True)
+        for name in ("p1_0.jpg", "p1_1.jpg", "p2_0.jpg"):
+            make_face_file(self.g1, name)
+        make_face_file(self.g2, "p3_0.jpg")
+        make_face_file(self.g1, "ghost_0.jpg")
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, '', 1, ?, ?)",
+            [(1, str(self.g1), "Alice"), (2, str(self.g2), "Bob")],
+        )
+        conn.executemany(
+            "INSERT INTO group_image_paths VALUES (?, ?)",
+            [(1, self.P1), (1, self.P2), (2, self.P3)],
+        )
+        conn.executemany(
+            "INSERT INTO group_cropped_faces VALUES (?, ?)",
+            [(1, "p1_0"), (1, "p1_1"), (1, "p2_0"), (2, "p3_0"),
+             (1, "ghost_0")],
+        )
+        conn.executemany(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, 0.1, 0.1, 0.2, 0.2, ?, 0)",
+            [(self.P1, 0, "p1_0", 1), (self.P1, 1, "p1_1", 1),
+             (self.P2, 0, "p2_0", 1), (self.P3, 0, "p3_0", 2)],
+        )
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+        self.db = {"db_file": str(self.db_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def paths_of(self, group_id):
+        groups = {g["id"]: g for g in
+                  self.client.get(f"/api/groups?{self.q}").get_json()["groups"]}
+        return sorted(groups[group_id]["image_paths"])
+
+    def test_move_shares_photo_when_faces_remain(self):
+        resp = self.client.post(
+            "/api/faces/bulk-move",
+            json={"items": [{"group_id": 1, "filename": "p1_1.jpg"}],
+                  "target_group_id": 2, **self.db},
+        )
+        self.assertEqual(resp.status_code, 200)
+        # P1 now belongs to both groups; the other photos are untouched.
+        self.assertEqual(self.paths_of(1), [self.P1, self.P2])
+        self.assertEqual(self.paths_of(2), [self.P1, self.P3])
+        photos = resp.get_json()["photos"]
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(photos[0]["photo"], self.P1)
+        self.assertFalse(photos[0]["unlinked_source"])
+        self.assertTrue((self.g2 / "p1_1.jpg").exists())
+
+    def test_move_transfers_photo_of_last_face(self):
+        resp = self.client.post(
+            "/api/faces/bulk-move",
+            json={"items": [{"group_id": 1, "filename": "p2_0.jpg"}],
+                  "target_group_id": 2, **self.db},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.paths_of(1), [self.P1])
+        self.assertEqual(self.paths_of(2), [self.P2, self.P3])
+        photos = resp.get_json()["photos"]
+        self.assertTrue(photos[0]["unlinked_source"])
+
+    def test_move_without_tags_leaves_photos_alone(self):
+        resp = self.client.post(
+            "/api/faces/bulk-move",
+            json={"items": [{"group_id": 1, "filename": "ghost_0.jpg"}],
+                  "target_group_id": 2, **self.db},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["photos"], [])
+        self.assertEqual(self.paths_of(1), [self.P1, self.P2])
+        self.assertEqual(self.paths_of(2), [self.P3])
+
+    def test_undo_move_restores_photo_links(self):
+        self.client.post(
+            "/api/faces/bulk-move",
+            json={"items": [{"group_id": 1, "filename": "p2_0.jpg"}],
+                  "target_group_id": 2, **self.db},
+        )
+        self.assertEqual(self.client.post("/api/undo", json=self.db).status_code, 200)
+        self.assertEqual(self.paths_of(1), [self.P1, self.P2])
+        self.assertEqual(self.paths_of(2), [self.P3])
+
+    def test_approve_keeps_photos(self):
+        self.assertEqual(
+            self.client.post("/api/groups/2/approve", json=self.db).status_code, 200)
+        self.assertEqual(self.paths_of(2), [self.P3])
 
 
 if __name__ == "__main__":

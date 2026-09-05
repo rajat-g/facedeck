@@ -18,11 +18,12 @@ import {
     sourceUrl,
     state,
 } from "./core.js";
-import { toastError, toastSuccess } from "./toast.js";
+import { photosSuffix, toastError, toastSuccess } from "./toast.js";
 import {
     approveAllGroups,
     approveGroup,
     deleteFaces,
+    deleteGroup,
     moveFaces,
     renameGroup,
     revealGroupFolder,
@@ -156,14 +157,9 @@ function updateDetailCounts() {
     const g = selectedGroup();
     const pane = $("#person-detail");
     if (!g || !pane || !pane.querySelector(".detail-name")) return;
-    const approved = g.face_count === 0 && g.photo_count > 0;
     const badges = pane.querySelector(".badges");
     if (badges) {
-        badges.innerHTML =
-            `<span class="badge">${g.face_count} faces</span>` +
-            `<span class="badge">${g.photo_count} photos</span>` +
-            `<span class="badge ${approved ? "approved" : "pending"}">` +
-            `${approved ? "✓ Approved" : "Pending"}</span>`;
+        badges.innerHTML = badgesHtml(g);
     }
     const facesCount = pane.querySelector("#faces-section .count");
     if (facesCount) facesCount.textContent = g.face_count;
@@ -207,6 +203,18 @@ function resetViewers() {
 /* ---------- Filter / sort / paginate people ---------- */
 
 function isApproved(g) { return g.face_count === 0 && g.photo_count > 0; }
+
+function isEmptyGroup(g) { return g.face_count === 0 && g.photo_count === 0; }
+
+function badgesHtml(g) {
+    const approved = isApproved(g);
+    return `<span class="badge">${g.face_count} faces</span>` +
+        `<span class="badge">${g.photo_count} photos</span>` +
+        (isEmptyGroup(g)
+            ? `<span class="badge">Empty</span>`
+            : `<span class="badge ${approved ? "approved" : "pending"}">` +
+              `${approved ? "✓ Approved" : "Pending"}</span>`);
+}
 
 function filteredGroups() {
     const q = state.query.toLowerCase();
@@ -336,9 +344,7 @@ function renderDetail() {
             <div class="detail-id">
                 <input type="text" class="detail-name" value="" title="Person name (stored in database)" aria-label="Person name">
                 <div class="badges">
-                    <span class="badge">${g.face_count} faces</span>
-                    <span class="badge">${g.photo_count} photos</span>
-                    <span class="badge ${approved ? "approved" : "pending"}">${approved ? "✓ Approved" : "Pending"}</span>
+                    ${badgesHtml(g)}
                 </div>
                 <div class="folder-path" title="${escapeHtml(g.directory)}">${escapeHtml(g.directory)}</div>
             </div>
@@ -348,6 +354,7 @@ function renderDetail() {
             <button class="btn copy-paths" title="Copy all source photo paths">⧉ Copy paths</button>
             <button class="btn open-folder" title="Open this person's folder in Explorer">🗁 Open folder</button>
             <button class="btn ${approved ? "" : "success"} approve-one" ${g.face_count === 0 ? "disabled" : ""} title="Approve — permanently delete cropped faces">✓ Approve</button>
+            ${isEmptyGroup(g) ? '<button class="btn danger delete-group" title="Delete this empty group (nothing to lose — it has no faces or photos)">🗑 Delete group</button>' : ""}
             <span class="run-lock-note" title="Move, delete, approve and undo are paused while a grouping run is in progress">⏸ Curation paused during run</span>
         </div>
         <div class="section" id="faces-section">
@@ -461,6 +468,15 @@ function wireDetailHeader(pane, g) {
         toastSuccess(`Approved “${g.name}” — ${result.deleted} crop(s) deleted.`);
         loadGroups();
     });
+    const deleteBtn = pane.querySelector(".delete-group");
+    if (deleteBtn) deleteBtn.addEventListener("click", async () => {
+        if (!confirm(`Delete empty group “${g.name}”?\n\nThe group entry will be removed. Nothing else is affected — it has no faces or photos.`)) return;
+        deleteBtn.disabled = true;
+        const result = await deleteGroup(g.id);
+        if (!result) { deleteBtn.disabled = false; return; }
+        toastSuccess(`Deleted empty group “${g.name}”. Use Undo to restore.`);
+        loadGroups();
+    });
 }
 
 async function fetchAllPhotoPaths(groupId) {
@@ -487,9 +503,10 @@ async function loadFaces(page) {
     try {
         const data = await api(`/api/groups/${g.id}/faces?page=${page}&per_page=${FACES_PER_PAGE}`);
         if (myReq !== facesReq || state.selectedId !== g.id) return;
+        if (!Array.isArray(data.faces)) throw new Error("bad faces response");
         state.faces.items = data.faces;
-        state.faces.total = data.total;
-        state.faces.page = data.page;
+        state.faces.total = Number.isFinite(data.total) ? data.total : data.faces.length;
+        state.faces.page = Number.isFinite(data.page) ? data.page : page;
     } catch (err) {
         if (myReq !== facesReq) return;
         toastError(`Failed to load faces: ${err.message}`);
@@ -585,9 +602,10 @@ async function loadPhotos(page) {
             `/api/groups/${g.id}/photos?page=${page}&per_page=${perPage}&q=${encodeURIComponent(state.photos.query)}`
         );
         if (myReq !== photosReq || state.selectedId !== g.id) return;
+        if (!Array.isArray(data.photos)) throw new Error("bad photos response");
         state.photos.items = data.photos;
-        state.photos.total = data.total;
-        state.photos.page = data.page;
+        state.photos.total = Number.isFinite(data.total) ? data.total : data.photos.length;
+        state.photos.page = Number.isFinite(data.page) ? data.page : page;
     } catch (err) {
         if (myReq !== photosReq) return;
         toastError(`Failed to load photos: ${err.message}`);
@@ -819,7 +837,7 @@ async function bulkMove() {
     );
     if (!result) return;
     clearSelection();
-    toastSuccess(`Moved ${result.moved} face(s).`);
+    toastSuccess(`Moved ${result.moved} face(s).` + photosSuffix(result));
     loadGroups();
 }
 
@@ -843,7 +861,7 @@ async function handleDrop(e, targetGroup) {
     const result = await moveFaces(items, targetGroup.id, "");
     if (!result) return;
     clearSelection();
-    toastSuccess(`Moved ${result.moved} face(s) to ${targetGroup.name}.`);
+    toastSuccess(`Moved ${result.moved} face(s) to ${targetGroup.name}.` + photosSuffix(result));
     loadGroups();
 }
 
