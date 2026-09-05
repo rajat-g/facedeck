@@ -44,7 +44,12 @@ Then open http://127.0.0.1:5000 in your browser.
 The web UI lets you:
 - Pick input folders (multiple supported) and DB file with native folder/file dialogs
 - Start grouping with a live progress bar, log, and a cancel button
-- View all face groups as thumbnail grids with search/filter, sorting, and pagination
+- Browse people as a fast list (no images loaded up front — safe for thousands of photos)
+- Select a person to see counts, then explicitly choose per section:
+  - Face crops: click "View on UI" for a paginated, lazy-loaded grid, or keep previews off
+  - Source photos: List mode shows filenames with zero images, Thumbs mode loads one page at a time,
+    and every photo has Preview (single-image viewer) plus Reveal (opens Explorer on the server);
+    "Open folder" reveals the whole group folder without loading anything in the browser
 - Name people (stored in the database) shown on group cards
 - View a face in a lightbox together with the source photo(s) it came from
 - Remove incorrect/unwanted faces (moved to a `.trash` folder) and undo moves/deletes

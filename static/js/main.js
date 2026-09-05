@@ -1,34 +1,16 @@
-/* App entry point: wiring, keyboard shortcuts, theme, undo */
+/* App entry: wiring, shortcuts, theme, config summary */
 
-import {
-    $,
-    api,
-    escapeHtml,
-    getDbFile,
-    loadSettings,
-    saveSettings,
-    state,
-} from "./core.js";
+import { $, api, getDbFile, loadSettings, saveSettings, state } from "./core.js";
 import { toastSuccess } from "./toast.js";
 import { initBrowse } from "./browse.js";
 import { initRun } from "./run.js";
 import { initGroups, loadGroups } from "./groups.js";
-import {
-    initLightbox,
-    closeLightbox,
-    lightboxIsOpen,
-    lightboxNavigate,
-} from "./lightbox.js";
-import { openMoveModal } from "./movemodal.js";
+import { closeLightbox, initLightbox, lightboxIsOpen, lightboxNavigate, openFaceViewer } from "./lightbox.js";
+import { closeMoveModal, initMoveModal, moveModalIsOpen, openMoveModal } from "./movemodal.js";
 import { undoLast } from "./ops.js";
 
-/* ---------- Config panel collapse & summary ---------- */
-
 function updateConfigSummary() {
-    const folders = $("#input-folders")
-        .value.split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean).length;
+    const folders = $("#input-folders").value.split("\n").map((l) => l.trim()).filter(Boolean).length;
     const db = getDbFile();
     const dbShort = db.length > 28 ? "…" + db.slice(-27) : db;
     $("#config-summary").textContent =
@@ -36,27 +18,22 @@ function updateConfigSummary() {
 }
 
 $("#config-toggle").addEventListener("click", () => {
-    $("#config-panel").classList.toggle("collapsed");
+    const panel = $("#config-panel");
+    panel.classList.toggle("collapsed");
+    $("#config-toggle").setAttribute("aria-expanded", panel.classList.contains("collapsed") ? "false" : "true");
     saveSettings();
     updateConfigSummary();
 });
 
-/* ---------- Theme ---------- */
-
 $("#theme-btn").addEventListener("click", () => {
     const root = document.documentElement;
     root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
-    $("#theme-btn").innerHTML = root.dataset.theme === "dark" ? "&#9788;" : "&#9789;";
+    $("#theme-btn").textContent = root.dataset.theme === "dark" ? "☾" : "☀";
     saveSettings();
 });
 
-/* ---------- Config persistence & exports ---------- */
-
 for (const id of ["input-folders", "output-faces", "db-file", "output-file"]) {
-    $(`#${id}`).addEventListener("change", () => {
-        saveSettings();
-        updateConfigSummary();
-    });
+    $(`#${id}`).addEventListener("change", () => { saveSettings(); updateConfigSummary(); });
 }
 $("#threshold").addEventListener("input", () => {
     $("#threshold-value").textContent = parseFloat($("#threshold").value).toFixed(2);
@@ -73,65 +50,39 @@ $("#export-json-btn").addEventListener("click", () => {
     document.querySelector("details.menu").removeAttribute("open");
     window.open(`/api/export?format=json&db_file=${encodeURIComponent(getDbFile())}`, "_blank");
 });
-
 $("#undo-btn").addEventListener("click", async () => {
     const result = await undoLast();
     if (!result) return;
-    toastSuccess(`Undid ${result.action}: ${result.details.join(", ")}`);
+    toastSuccess(`Undid ${result.action}: ${(result.details || []).join(", ")}`);
     loadGroups();
 });
 
 /* ---------- Keyboard shortcuts ---------- */
 
 document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-        closeLightbox();
-        closeMoveModal();
-        return;
-    }
-
+    if (e.key === "Escape") { closeLightbox(); closeMoveModal(); return; }
     const tag = document.activeElement?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
     if (lightboxIsOpen()) {
         switch (e.key) {
-            case "ArrowRight":
-                e.preventDefault();
-                lightboxNavigate(1);
-                break;
-            case "ArrowLeft":
-                e.preventDefault();
-                lightboxNavigate(-1);
-                break;
-            case "m":
-            case "M":
-                $("#lightbox-move").click();
-                break;
-            case "Delete":
-            case "Backspace":
-                e.preventDefault();
-                $("#lightbox-delete").click();
-                break;
+            case "ArrowRight": e.preventDefault(); lightboxNavigate(1); break;
+            case "ArrowLeft": e.preventDefault(); lightboxNavigate(-1); break;
+            case "m": case "M": $("#lightbox-move").click(); break;
+            case "Delete": case "Backspace": e.preventDefault(); $("#lightbox-delete").click(); break;
         }
         return;
     }
-
     if (moveModalIsOpen()) return;
 
-    const tiles = [...document.querySelectorAll("#groups-container .face-tile")];
+    const tiles = [...document.querySelectorAll("#person-detail .face-tile")];
     const focusedIdx = tiles.indexOf(document.activeElement);
-
     if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
         e.preventDefault();
-        if (tiles.length === 0) return;
+        if (!tiles.length) return;
         let next;
-        if (focusedIdx === -1) {
-            next = e.key === "ArrowRight" ? 0 : tiles.length - 1;
-        } else {
-            next =
-                (focusedIdx + (e.key === "ArrowRight" ? 1 : -1) + tiles.length) %
-                tiles.length;
-        }
+        if (focusedIdx === -1) next = e.key === "ArrowRight" ? 0 : tiles.length - 1;
+        else next = (focusedIdx + (e.key === "ArrowRight" ? 1 : -1) + tiles.length) % tiles.length;
         focusTile(tiles[next]);
     } else if (focusedIdx !== -1 && (e.key === "Enter" || e.key === "m" || e.key === "M" || e.key === "Delete")) {
         e.preventDefault();
@@ -139,9 +90,8 @@ document.addEventListener("keydown", (e) => {
         const group = state.groups.find((g) => g.id == tile.dataset.groupId);
         if (!group) return;
         const filename = tile.dataset.filename;
-
         if (e.key === "Enter") {
-            openLightbox(group, group.faces.indexOf(filename));
+            openFaceViewer(group, state.faces.items, state.faces.items.indexOf(filename), state.faces.total);
         } else if (e.key.toLowerCase() === "m") {
             tile.dispatchEvent(new CustomEvent("request-move", { bubbles: true }));
         } else {
@@ -151,18 +101,15 @@ document.addEventListener("keydown", (e) => {
 });
 
 function focusTile(tile) {
-    document
-        .querySelectorAll(".face-tile.focused")
-        .forEach((t) => t.classList.remove("focused"));
+    document.querySelectorAll(".face-tile.focused").forEach((t) => t.classList.remove("focused"));
     tile.classList.add("focused");
     tile.focus();
     tile.scrollIntoView({ block: "nearest" });
 }
 
-/* ---------- Move-button requests from tiles ---------- */
-
 document.addEventListener("request-move", (e) => {
-    const tile = e.target;
+    const tile = e.target.closest ? e.target.closest(".face-tile") : e.target;
+    if (!tile?.dataset) return;
     const group = state.groups.find((g) => g.id == tile.dataset.groupId);
     if (group) openMoveModal(group, tile.dataset.filename);
 });

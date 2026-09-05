@@ -1,8 +1,11 @@
 import csv
 import io
 import json
+import os
+import platform
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import traceback
@@ -255,6 +258,7 @@ def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_fil
                         matchable.append(new_group)
 
                     if output_path and not output_path.exists():
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
                         x1, y1, x2, y2 = face.bbox.astype(int)
                         h, w = img.shape[:2]
                         x1, y1 = max(0, x1), max(0, y1)
@@ -380,12 +384,45 @@ def api_groups():
     if not Path(db_file).exists():
         return jsonify({"groups": []})
 
+    # summary=1 returns counts only (fast, no file lists) for large libraries.
+    summary = request.args.get("summary", "") in ("1", "true", "yes")
+    if request.args.get("light", "") in ("1", "true", "yes"):
+        summary = True
+
     conn = open_db(db_file)
     result = []
     for row in conn.execute(
         "SELECT id, directory, name FROM groups ORDER BY id"
     ):
         directory = Path(row["directory"])
+        mtime = directory.stat().st_mtime if directory.is_dir() else 0
+        name = row["name"] or directory.name
+        if summary:
+            photo_count = conn.execute(
+                "SELECT COUNT(*) FROM group_image_paths WHERE group_id=?",
+                (row["id"],),
+            ).fetchone()[0]
+            face_count = 0
+            if directory.is_dir():
+                try:
+                    face_count = sum(
+                        1
+                        for p in directory.iterdir()
+                        if p.is_file() and p.suffix.lower() in FACE_EXTENSIONS
+                    )
+                except OSError:
+                    face_count = 0
+            result.append(
+                {
+                    "id": row["id"],
+                    "name": name,
+                    "directory": str(directory),
+                    "face_count": face_count,
+                    "photo_count": photo_count,
+                    "mtime": mtime,
+                }
+            )
+            continue
         faces = []
         if directory.is_dir():
             faces = sorted(
@@ -403,15 +440,176 @@ def api_groups():
         result.append(
             {
                 "id": row["id"],
-                "name": row["name"] or directory.name,
+                "name": name,
                 "directory": str(directory),
                 "faces": faces,
                 "image_paths": image_paths,
-                "mtime": directory.stat().st_mtime if directory.is_dir() else 0,
+                # counts included so new UI can use either shape
+                "face_count": len(faces),
+                "photo_count": len(image_paths),
+                "mtime": mtime,
             }
         )
     conn.close()
     return jsonify({"groups": result})
+
+
+def _list_face_names(directory: Path):
+    """Sorted face-crop filenames in a group directory."""
+    if not directory.is_dir():
+        return []
+    try:
+        return sorted(
+            p.name
+            for p in directory.iterdir()
+            if p.is_file() and p.suffix.lower() in FACE_EXTENSIONS
+        )
+    except OSError:
+        return []
+
+
+@app.route("/api/groups/<int:group_id>/faces")
+def api_group_faces(group_id):
+    """Paginated face-crop filenames. ?page=1&per_page=48"""
+    db_file = request.args.get("db_file", "processing_state.db")
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = int(request.args.get("per_page", 48))
+    except (TypeError, ValueError):
+        per_page = 48
+    per_page = max(1, min(per_page, 200))
+
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    row = conn.execute(
+        "SELECT directory FROM groups WHERE id=?", (group_id,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return jsonify({"error": "Group not found"}), 404
+    names = _list_face_names(Path(row["directory"]))
+    total = len(names)
+    start = (page - 1) * per_page
+    return jsonify(
+        {
+            "faces": names[start:start + per_page],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
+    )
+
+
+@app.route("/api/groups/<int:group_id>/photos")
+def api_group_photos(group_id):
+    """Paginated source-photo paths. ?page=1&per_page=50&q=filter"""
+    db_file = request.args.get("db_file", "processing_state.db")
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = int(request.args.get("per_page", 50))
+    except (TypeError, ValueError):
+        per_page = 50
+    per_page = max(1, min(per_page, 200))
+    q = (request.args.get("q") or "").strip()
+
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    exists = conn.execute(
+        "SELECT 1 FROM groups WHERE id=?", (group_id,)
+    ).fetchone()
+    if exists is None:
+        conn.close()
+        return jsonify({"error": "Group not found"}), 404
+    if q:
+        like = f"%{q}%"
+        total = conn.execute(
+            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=? AND image_path LIKE ?",
+            (group_id, like),
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT image_path FROM group_image_paths WHERE group_id=? AND image_path LIKE ? "
+            "ORDER BY image_path LIMIT ? OFFSET ?",
+            (group_id, like, per_page, (page - 1) * per_page),
+        ).fetchall()
+    else:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=?",
+            (group_id,),
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT image_path FROM group_image_paths WHERE group_id=? "
+            "ORDER BY image_path LIMIT ? OFFSET ?",
+            (group_id, per_page, (page - 1) * per_page),
+        ).fetchall()
+    conn.close()
+    return jsonify(
+        {
+            "photos": [r[0] for r in rows],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
+    )
+
+
+def _reveal_path_on_server(target: Path):
+    """Open file manager on the server for a file or folder."""
+    system = platform.system()
+    if system == "Windows":
+        if target.is_file():
+            subprocess.Popen(["explorer", "/select,", str(target)])
+        else:
+            subprocess.Popen(["explorer", str(target)])
+    elif system == "Darwin":
+        if target.is_file():
+            subprocess.Popen(["open", "-R", str(target)])
+        else:
+            subprocess.Popen(["open", str(target)])
+    else:
+        folder = str(target if target.is_dir() else target.parent)
+        for cmd in (["xdg-open", folder], ["gio", "open", folder]):
+            try:
+                subprocess.Popen(cmd)
+                break
+            except FileNotFoundError:
+                continue
+        else:
+            raise OSError("No file manager found to reveal folder")
+
+
+@app.route("/api/groups/<int:group_id>/reveal-folder", methods=["POST"])
+def api_reveal_group_folder(group_id):
+    data = {}
+    try:
+        data = request.get_json(force=True) if request.data else {}
+    except Exception:
+        data = {}
+    db_file = (data.get("db_file") or request.args.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    row = conn.execute(
+        "SELECT directory FROM groups WHERE id=?", (group_id,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return jsonify({"error": "Group not found"}), 404
+    directory = Path(row["directory"])
+    if not directory.is_dir():
+        return jsonify({"error": "Group folder does not exist on server"}), 404
+    try:
+        _reveal_path_on_server(directory)
+        return jsonify({"ok": True, "path": str(directory)})
+    except Exception as exc:
+        return jsonify({"error": f"Reveal failed: {exc}"}), 500
 
 
 @app.route("/api/groups/<int:group_id>/faces/<path:filename>")
@@ -432,11 +630,24 @@ def api_face_image(group_id, filename):
 
 @app.route("/api/groups/<int:group_id>/rename", methods=["POST"])
 def api_rename_group(group_id):
-    data = request.get_json(force=True)
-    db_file = data.get("db_file", "processing_state.db")
+    data = {}
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        data = {}
+    # Support db_file from JSON body or query string for robustness
+    db_file = (data.get("db_file") or request.args.get("db_file") or "processing_state.db").strip() or "processing_state.db"
     new_name = (data.get("name") or "").strip()
     if not new_name:
         return jsonify({"error": "Name cannot be empty"}), 400
+
+    if not Path(db_file).exists():
+        # Try to give helpful error if DB not found; fallback may be relative vs absolute mismatch
+        alt = Path(db_file).resolve()
+        if alt.exists():
+            db_file = str(alt)
+        else:
+            return jsonify({"error": f"Database file does not exist: {db_file}"}), 404
 
     conn = open_db(db_file)
     row = conn.execute(
@@ -884,7 +1095,9 @@ def api_export():
 
 @app.route("/api/source-image")
 def api_source_image():
-    """Serve an original photo, only if it belongs to the given group."""
+    """Serve an original photo, only if it belongs to the given group.
+    HEIC/HEIF are converted to JPEG on-the-fly so browsers can preview them.
+    """
     db_file = request.args.get("db_file", "processing_state.db")
     try:
         group_id = int(request.args.get("group_id", ""))
@@ -904,7 +1117,167 @@ def api_source_image():
 
     if not allowed or not Path(path).is_file():
         return jsonify({"error": "Image not found"}), 404
-    return send_file(path)
+
+    # HEIC/HEIF need conversion for browser preview (Chrome/Firefox don't render HEIC)
+    if path.lower().endswith((".heic", ".heif")):
+        try:
+            img = read_image(path)
+            if img is None:
+                return jsonify({"error": "Could not decode HEIC image"}), 500
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                return jsonify({"error": "HEIC conversion failed"}), 500
+            return send_file(
+                io.BytesIO(buf.tobytes()),
+                mimetype="image/jpeg",
+                as_attachment=False,
+                download_name=Path(path).stem + ".jpg",
+                max_age=3600,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return jsonify({"error": f"HEIC preview failed: {exc}"}), 500
+
+    return send_file(path, max_age=3600)
+
+
+# ---------- Approve (permanent crop deletion) ----------
+
+def _approve_group_crops(conn, group_id):
+    """Permanently delete cropped face files for one group. Returns (deleted_count, dir_removed)."""
+    row = conn.execute("SELECT directory FROM groups WHERE id=?", (group_id,)).fetchone()
+    if row is None:
+        raise LookupError("Group not found")
+    directory = Path(row["directory"])
+    deleted = 0
+    dir_removed = False
+    did_exist = directory.is_dir()
+
+    if did_exist:
+        for p in list(directory.iterdir()):
+            if p.is_file() and p.suffix.lower() in FACE_EXTENSIONS:
+                try:
+                    p.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+    # count DB entries that may remain even if file missing
+    cur = conn.execute("SELECT COUNT(*) FROM group_cropped_faces WHERE group_id=?", (group_id,)).fetchone()
+    db_count = cur[0] if cur else 0
+    if deleted == 0 and db_count > 0:
+        deleted = db_count
+
+    conn.execute("DELETE FROM group_cropped_faces WHERE group_id=?", (group_id,))
+
+    # delete empty dir permanently only if it existed before and is now empty
+    if did_exist and directory.is_dir():
+        try:
+            if not any(directory.iterdir()):
+                directory.rmdir()
+                dir_removed = True
+        except OSError:
+            pass
+
+    return deleted, dir_removed
+
+
+@app.route("/api/groups/<int:group_id>/approve", methods=["POST"])
+def api_approve_group(group_id):
+    data = request.get_json(force=True) if request.data else {}
+    db_file = (data.get("db_file") or request.args.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        deleted, dir_removed = _approve_group_crops(conn, group_id)
+        conn.commit()
+        return jsonify({"ok": True, "deleted": deleted, "dir_removed": dir_removed})
+    except LookupError as exc:
+        conn.rollback()
+        return jsonify({"error": str(exc)}), 404
+    except OSError as exc:
+        conn.rollback()
+        return jsonify({"error": f"Approve failed: {exc}"}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/groups/approve-all", methods=["POST"])
+def api_approve_all():
+    data = request.get_json(force=True) if request.data else {}
+    db_file = (data.get("db_file") or request.args.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        total_deleted = 0
+        dirs_removed = 0
+        groups_processed = 0
+        for (gid,) in list(conn.execute("SELECT id FROM groups")):
+            deleted, dir_removed = _approve_group_crops(conn, gid)
+            total_deleted += deleted
+            if dir_removed:
+                dirs_removed += 1
+            groups_processed += 1
+        conn.commit()
+        return jsonify({
+            "ok": True,
+            "groups": groups_processed,
+            "deleted": total_deleted,
+            "dirs_removed": dirs_removed,
+        })
+    except OSError as exc:
+        conn.rollback()
+        return jsonify({"error": f"Approve all failed: {exc}"}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/reveal", methods=["POST"])
+def api_reveal():
+    data = request.get_json(force=True)
+    db_file = (data.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    try:
+        group_id = int(data.get("group_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid group id"}), 400
+    path = (data.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "Missing path"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    allowed = conn.execute(
+        "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
+        (group_id, path),
+    ).fetchone()
+    conn.close()
+    if not allowed:
+        return jsonify({"error": "Image not associated with this group"}), 404
+    file_path = Path(path)
+    if not file_path.exists():
+        return jsonify({"error": "File does not exist on server"}), 404
+    try:
+        system = platform.system()
+        if system == "Windows":
+            # Use explorer /select to highlight file
+            subprocess.Popen(["explorer", "/select,", str(file_path)])
+        elif system == "Darwin":
+            subprocess.Popen(["open", "-R", str(file_path)])
+        else:
+            # Linux: try to open parent folder; no universal select
+            folder = str(file_path.parent)
+            for cmd in (["xdg-open", folder], ["gio", "open", folder]):
+                try:
+                    subprocess.Popen(cmd)
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                return jsonify({"error": "No file manager found to reveal folder"}), 500
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"error": f"Reveal failed: {exc}"}), 500
 
 
 if __name__ == "__main__":

@@ -1,35 +1,60 @@
-/* Lightbox: enlarged face + source photos */
+/* Single-image viewer: loads only one image at a time (scalable). */
 
-import { $, state, faceUrl, sourceUrl } from "./core.js";
-import { deleteFaces } from "./ops.js";
-import { openMoveModal } from "./movemodal.js";
+import { $, basename, escapeHtml, faceUrl, sourceUrl, state } from "./core.js";
+import { deleteFaces, revealInExplorer } from "./ops.js";
+import { toastSuccess } from "./toast.js";
 
 let refresh = () => {};
 
 export function initLightbox(loadGroups) {
     refresh = loadGroups;
-
     $("#lightbox-close").addEventListener("click", closeLightbox);
+    $("#lightbox-prev").addEventListener("click", () => lightboxNavigate(-1));
+    $("#lightbox-next").addEventListener("click", () => lightboxNavigate(1));
     $("#lightbox-delete").addEventListener("click", lightboxDelete);
     $("#lightbox-move").addEventListener("click", () => {
         const lb = state.lightbox;
-        if (!lb) return;
-        const filename = lb.group.faces[lb.index];
-        const groupId = lb.group.id;
+        if (!lb || lb.kind !== "face") return;
+        const filename = lb.items[lb.index];
+        const groupId = lb.groupId;
         closeLightbox();
-        const group = state.groups.find((g) => g.id === groupId);
-        if (group) openMoveModal(group, filename);
+        const evt = new CustomEvent("request-move-explicit", { detail: { groupId, filename } });
+        document.dispatchEvent(evt);
     });
     $("#lightbox").addEventListener("click", (e) => {
         if (e.target === e.currentTarget) closeLightbox();
     });
 }
 
-export function openLightbox(group, index) {
-    state.lightbox = { group, index };
-    renderFace();
+export function openFaceViewer(group, items, index, total) {
+    state.lightbox = {
+        kind: "face",
+        groupId: group.id,
+        groupName: group.name,
+        items: [...items],
+        index: Math.max(0, index),
+        total: total ?? items.length,
+    };
+    renderViewer();
     $("#lightbox").classList.remove("hidden");
 }
+
+export function openSourceViewer(group, items, index, total) {
+    state.lightbox = {
+        kind: "source",
+        groupId: group.id,
+        groupName: group.name,
+        items: [...items],
+        index: Math.max(0, index),
+        total: total ?? items.length,
+    };
+    renderViewer();
+    $("#lightbox").classList.remove("hidden");
+}
+
+// Back-compat aliases used by older call sites
+export const openLightbox = openFaceViewer;
+export const openSourcePreview = openSourceViewer;
 
 export function closeLightbox() {
     $("#lightbox").classList.add("hidden");
@@ -42,75 +67,81 @@ export function lightboxIsOpen() {
 
 export function lightboxNavigate(delta) {
     const lb = state.lightbox;
-    if (!lb) return;
-    const len = lb.group.faces.length;
-    lb.index = (lb.index + delta + len) % len;
-    renderFace();
-}
-
-function currentFilename() {
-    const lb = state.lightbox;
-    return lb ? lb.group.faces[lb.index] : null;
+    if (!lb || lb.items.length === 0) return;
+    lb.index = (lb.index + delta + lb.items.length) % lb.items.length;
+    renderViewer();
 }
 
 async function lightboxDelete() {
-    const filename = currentFilename();
+    const lb = state.lightbox;
+    if (!lb || lb.kind !== "face") return;
+    const filename = lb.items[lb.index];
     if (!filename) return;
-    if (!confirm(`Remove "${filename}"?\nThe face will be moved to the trash folder.`)) return;
-
-    const result = await deleteFaces([{ group_id: state.lightbox.group.id, filename }]);
+    if (!confirm(`Remove “${filename}”?\nThe face will be moved to the trash folder.`)) return;
+    const result = await deleteFaces([{ group_id: lb.groupId, filename }]);
     if (!result) return;
-
+    toastSuccess("Face moved to trash. Use Undo to restore.");
     closeLightbox();
     refresh();
 }
 
-function renderFace() {
+function renderViewer() {
     const lb = state.lightbox;
     if (!lb) return;
-    const group = lb.group;
-    const filename = group.faces[lb.index];
-    if (!filename) {
-        closeLightbox();
-        return;
-    }
+    const isFace = lb.kind === "face";
+    const current = lb.items[lb.index];
+    if (current == null) { closeLightbox(); return; }
 
-    $("#lightbox-title").textContent =
-        `${group.name} — face ${lb.index + 1} / ${group.faces.length} (${filename})`;
-    $("#lightbox-img").src = faceUrl(group, filename);
+    const name = isFace ? current : basename(current);
+    $("#lightbox-title").textContent = `${lb.groupName} — ${name}`;
+    const img = $("#lightbox-img");
+    img.src = isFace ? faceUrl(lb.groupId, current) : sourceUrl(lb.groupId, current);
+    img.alt = name;
+    img.title = current;
 
-    const sourcesBox = $("#lightbox-sources");
-    sourcesBox.innerHTML = "";
-    const sources = group.image_paths;
+    const shown = lb.items.length;
+    $("#lightbox-counter").textContent =
+        shown > 1 ? `${lb.index + 1} of ${shown} shown · ${lb.total} total` : `${lb.total} total`;
 
-    if (sources.length === 0) {
-        sourcesBox.innerHTML = '<p class="muted">No source photo paths recorded.</p>';
-        return;
-    }
+    const prev = $("#lightbox-prev");
+    const next = $("#lightbox-next");
+    const showNav = shown > 1;
+    prev.style.display = showNav ? "" : "none";
+    next.style.display = showNav ? "" : "none";
 
-    const label = document.createElement("p");
-    label.className = "muted";
-    label.textContent = `Source photo(s) (${sources.length}):`;
-    sourcesBox.appendChild(label);
+    $("#lightbox-move").classList.toggle("hidden", !isFace);
+    $("#lightbox-delete").classList.toggle("hidden", !isFace);
 
-    for (const src of sources) {
-        const row = document.createElement("div");
-        row.className = "source-row";
-        row.innerHTML = `
-            <button type="button" class="link-btn view-src"
-                    title="View full photo">${escapeAttr(src)}</button>
-            <a href="${sourceUrl(group.id, src)}" target="_blank" rel="noopener">open</a>
-        `;
-        row.querySelector(".view-src").addEventListener("click", () => {
-            $("#lightbox-img").src = sourceUrl(group.id, src);
-            $("#lightbox-title").textContent = `${group.name} — ${src}`;
+    const box = $("#lightbox-sources");
+    box.innerHTML = "";
+    const meta = document.createElement("div");
+    meta.className = "meta-bar";
+    meta.innerHTML =
+        `<div class="meta-text"><div class="meta-name">${escapeHtml(name)}</div>` +
+        `<div class="meta-path" title="${escapeHtml(current)}">${escapeHtml(isFace ? `Face crop · group ${lb.groupId}` : current)}</div></div>`;
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "btn";
+    copyBtn.textContent = "⧉ Copy path";
+    copyBtn.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(current); toastSuccess("Path copied."); }
+        catch (_) { toastSuccess(current); }
+    });
+    meta.appendChild(copyBtn);
+    if (!isFace) {
+        const revealBtn = document.createElement("button");
+        revealBtn.className = "btn";
+        revealBtn.textContent = "🗁 Reveal";
+        revealBtn.addEventListener("click", async () => {
+            const res = await revealInExplorer(lb.groupId, current);
+            if (res) toastSuccess("Opened in Explorer.");
         });
-        sourcesBox.appendChild(row);
+        meta.appendChild(revealBtn);
     }
-}
-
-function escapeAttr(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
+    box.appendChild(meta);
+    if (!isFace) {
+        const hint = document.createElement("div");
+        hint.className = "muted small";
+        hint.textContent = "Tip: use ← → to step through this page. Refine search or change pages in the detail panel for more.";
+        box.appendChild(hint);
+    }
 }

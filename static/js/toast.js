@@ -1,4 +1,4 @@
-/* Toast notifications (replace alert()) */
+/* Toast notifications */
 
 let wrap = null;
 
@@ -16,9 +16,7 @@ export function toast(message, type = "info", timeoutMs = 3500) {
     el.className = `toast toast-${type}`;
     el.textContent = message;
     ensureWrap().appendChild(el);
-
     requestAnimationFrame(() => el.classList.add("visible"));
-
     setTimeout(() => {
         el.classList.remove("visible");
         setTimeout(() => el.remove(), 300);

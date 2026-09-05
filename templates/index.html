@@ -1,163 +1,231 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>InsightFace Photo Grouping</title>
+    <meta name="theme-color" content="#0f1117">
+    <title>FaceDeck — InsightFace Photo Organizer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <header>
-        <div class="header-title">
-            <h1>Face Grouping</h1>
-            <span class="header-sub">InsightFace</span>
+    <header class="topbar">
+        <div class="topbar-inner">
+            <div class="brand">
+                <div class="brand-mark" aria-hidden="true">◈</div>
+                <div class="brand-text">
+                    <strong>FaceDeck</strong>
+                    <span>InsightFace · Photo Organizer</span>
+                </div>
+            </div>
+            <div class="topbar-right">
+                <div id="header-stat" class="header-stat hidden">
+                    <span class="dot" aria-hidden="true"></span>
+                    <span id="header-stat-text">0 people</span>
+                </div>
+                <button id="theme-btn" class="icon-btn" title="Toggle theme" aria-label="Toggle theme">☾</button>
+            </div>
         </div>
-        <button id="theme-btn" title="Toggle dark/light theme">&#9789;</button>
     </header>
 
-    <main>
+    <main class="app">
+        <!-- Setup / run -->
         <section id="config-panel" class="card collapsed">
-            <div id="config-toggle" class="card-header" title="Click to expand/collapse">
-                <h2>Configuration</h2>
-                <span id="config-summary" class="muted"></span>
-                <button id="config-collapse-btn" class="icon-btn" aria-label="Toggle configuration">&#9662;</button>
-            </div>
-            <div id="config-body">
-                <div class="form-row">
-                    <label for="input-folders">Input folders (one per line)</label>
-                    <div class="input-with-btn">
-                        <textarea id="input-folders" rows="2" placeholder="C:\path\to\photos&#10;C:\other\photos"></textarea>
-                        <button type="button" id="browse-folder-btn">Add...</button>
+            <button id="config-toggle" class="config-head" aria-expanded="false">
+                <span class="config-head-left">
+                    <span class="config-ico" aria-hidden="true">⚙</span>
+                    <span class="config-title">Setup &amp; Run</span>
+                    <span id="config-summary" class="muted config-summary"></span>
+                </span>
+                <span id="config-collapse-btn" class="chevron" aria-hidden="true">▾</span>
+            </button>
+            <div id="config-body" class="config-body">
+                <div class="field">
+                    <label for="input-folders">Input folders <span class="muted">— one per line</span></label>
+                    <div class="field-row">
+                        <textarea id="input-folders" rows="2" placeholder="C:\Photos\2024&#10;C:\Photos\Family"></textarea>
+                        <button type="button" id="browse-folder-btn" class="btn">Add…</button>
                     </div>
                 </div>
-                <div class="form-row-grid">
-                    <div class="form-row">
+                <div class="grid-2">
+                    <div class="field">
                         <label for="output-faces">Output faces folder</label>
                         <input type="text" id="output-faces" value="output_faces">
                     </div>
-                    <div class="form-row">
+                    <div class="field">
                         <label for="db-file">Database file</label>
-                        <div class="input-with-btn">
+                        <div class="field-row">
                             <input type="text" id="db-file" value="processing_state.db">
-                            <button type="button" id="browse-db-btn">Browse...</button>
+                            <button type="button" id="browse-db-btn" class="btn">Browse…</button>
                         </div>
                     </div>
                 </div>
-                <div class="form-row-grid">
-                    <div class="form-row">
+                <div class="grid-2">
+                    <div class="field">
                         <label for="output-file">Report file</label>
                         <input type="text" id="output-file" value="face_groups.txt">
                     </div>
-                    <div class="form-row">
-                        <label for="threshold">Similarity threshold: <span id="threshold-value">0.60</span></label>
+                    <div class="field">
+                        <label for="threshold">Similarity threshold: <strong id="threshold-value">0.60</strong></label>
                         <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
+                        <div class="range-hints"><span>Strict</span><span>Balanced</span><span>Lenient</span></div>
                     </div>
                 </div>
-                <div class="actions">
-                    <button id="run-btn" class="primary">Start grouping</button>
-                    <button id="cancel-btn" class="danger hidden">Cancel run</button>
-                    <button id="refresh-btn">Refresh</button>
-                    <button id="undo-btn" title="Undo last move or delete">Undo</button>
+                <div class="config-actions">
+                    <button id="run-btn" class="btn primary"><span aria-hidden="true">▶</span> Start grouping</button>
+                    <button id="cancel-btn" class="btn danger hidden">✕ Cancel</button>
+                    <button id="refresh-btn" class="btn">↻ Refresh</button>
+                    <button id="undo-btn" class="btn ghost" title="Undo last move or delete">↩ Undo</button>
                     <details class="menu">
-                        <summary>Export &#9662;</summary>
+                        <summary class="btn">Export ▾</summary>
                         <div class="menu-items">
-                            <button id="export-csv-btn">Export CSV</button>
-                            <button id="export-json-btn">Export JSON</button>
+                            <button id="export-csv-btn" class="menu-item">⬇ Export CSV</button>
+                            <button id="export-json-btn" class="menu-item">⬇ Export JSON</button>
                         </div>
                     </details>
                 </div>
             </div>
         </section>
 
-        <section id="status-panel" class="card hidden">
-            <h2>Status</h2>
-            <div class="progress-wrap">
+        <!-- Run progress -->
+        <section id="status-panel" class="card status hidden">
+            <div class="status-head">
+                <h2><span class="pulse" aria-hidden="true"></span> Processing</h2>
+                <span id="status-meta" class="muted"></span>
+            </div>
+            <div class="progress" role="progressbar" aria-label="Processing progress">
                 <div id="progress-bar"></div>
                 <span id="progress-text">0 / 0</span>
             </div>
-            <pre id="log-output"></pre>
-            <div id="error-box" class="error-box hidden"></div>
+            <pre id="log-output" aria-live="polite"></pre>
+            <div id="error-box" class="error hidden"></div>
         </section>
 
-        <section id="stats-panel" class="card compact hidden">
-            <div id="stats-summary" class="stats-chips"></div>
+        <section id="stats-panel" class="card stats hidden">
+            <div id="stats-summary" class="chips"></div>
         </section>
 
-        <section id="groups-panel">
-            <div class="groups-toolbar">
-                <h2>Face Groups</h2>
-                <div class="filters">
-                    <input type="search" id="filter-text" placeholder="Filter by name or source photo...">
-                    <label class="min-faces">Min faces
-                        <input type="number" id="filter-min-faces" min="0" value="0">
-                    </label>
-                    <label class="min-faces">Sort
-                        <select id="sort-by">
-                            <option value="default">Default</option>
-                            <option value="name">Name A-Z</option>
-                            <option value="size-desc">Most faces</option>
-                            <option value="size-asc">Fewest faces</option>
-                            <option value="newest">Newest activity</option>
-                        </select>
-                    </label>
+        <!-- People toolbar -->
+        <section class="card toolbar">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">People <span id="groups-count" class="count-pill"></span></h2>
+                <div class="search">
+                    <span class="search-ico" aria-hidden="true">⌕</span>
+                    <input type="search" id="filter-text" placeholder="Search person name…" autocomplete="off">
+                    <button id="filter-clear" class="icon-btn hidden" title="Clear search">✕</button>
                 </div>
             </div>
-            <p id="groups-empty" class="muted">No groups yet. Run the grouping or click "Refresh groups".</p>
-            <div id="groups-container"></div>
-            <div id="pagination" class="pagination hidden">
-                <button id="page-prev">&larr; Prev</button>
-                <span id="page-info"></span>
-                <button id="page-next">Next &rarr;</button>
+            <div class="toolbar-row wrap">
+                <div class="pills" role="group" aria-label="Filter by status">
+                    <button data-status="all" class="pill active">All</button>
+                    <button data-status="pending" class="pill">Pending</button>
+                    <button data-status="approved" class="pill">Approved ✓</button>
+                </div>
+                <div class="toolbar-filters">
+                    <label class="inline-field">Min photos
+                        <input type="number" id="filter-min-faces" min="0" value="0">
+                    </label>
+                    <label class="inline-field">Sort
+                        <select id="sort-by">
+                            <option value="default">Default</option>
+                            <option value="name">Name A–Z</option>
+                            <option value="size-desc">Most photos</option>
+                            <option value="size-asc">Fewest photos</option>
+                            <option value="newest">Newest</option>
+                        </select>
+                    </label>
+                    <button id="approve-all-btn" class="btn success" title="Approve all pending — permanently delete cropped faces">✓ Approve all</button>
+                </div>
             </div>
+            <div id="filter-summary" class="muted filter-summary hidden"></div>
         </section>
+
+        <!-- Master / detail workspace -->
+        <div class="workspace">
+            <aside class="card people-pane" aria-label="People list">
+                <div class="pane-head">
+                    <span class="pane-title">People</span>
+                    <span id="people-count" class="muted small"></span>
+                </div>
+                <div id="groups-empty" class="empty hidden">
+                    <div class="empty-ico" aria-hidden="true">⊘</div>
+                    <h3>No groups yet</h3>
+                    <p class="muted">Run grouping or click Refresh to load existing results.</p>
+                </div>
+                <div id="people-list" class="people-list" role="listbox" aria-label="People"></div>
+                <div id="pagination" class="pager hidden">
+                    <button id="page-prev" class="btn">← Prev</button>
+                    <span id="page-info" class="muted small mono"></span>
+                    <button id="page-next" class="btn">Next →</button>
+                </div>
+            </aside>
+
+            <section id="person-detail" class="card detail-pane" aria-label="Person details" aria-live="polite">
+                <div class="empty detail-empty">
+                    <div class="empty-ico" aria-hidden="true">☺</div>
+                    <h3>Select a person</h3>
+                    <p class="muted">Choose someone on the left to review them.<br>Images stay unloaded until you ask for them — fast even with thousands of photos.</p>
+                </div>
+            </section>
+        </div>
     </main>
 
-    <!-- Floating bulk actions bar -->
-    <div id="bulk-bar" class="hidden">
-        <span id="bulk-count">0 selected</span>
-        <label><input type="radio" name="bulk-target" value="existing" checked>
-            Move to <select id="bulk-target-select"></select></label>
-        <label><input type="radio" name="bulk-target" value="new">
-            New group <input type="text" id="bulk-new-group-name" placeholder="name (empty = auto)"></label>
-        <button id="bulk-move-btn" class="primary">Move</button>
-        <button id="bulk-delete-btn" class="danger">Delete</button>
-        <button id="bulk-clear-btn" class="secondary">Clear</button>
+    <!-- Bulk selection bar -->
+    <div id="bulk-bar" class="bulkbar hidden" role="toolbar" aria-label="Bulk actions">
+        <span id="bulk-count" class="bulk-count">0 selected</span>
+        <span class="bulk-sep" aria-hidden="true"></span>
+        <label class="bulk-opt"><input type="radio" name="bulk-target" value="existing" checked> Move to
+            <select id="bulk-target-select"></select>
+        </label>
+        <label class="bulk-opt"><input type="radio" name="bulk-target" value="new"> New group
+            <input type="text" id="bulk-new-group-name" placeholder="name (empty = auto)">
+        </label>
+        <button id="bulk-move-btn" class="btn primary">Move</button>
+        <button id="bulk-delete-btn" class="btn danger">Delete</button>
+        <button id="bulk-clear-btn" class="btn ghost">Clear</button>
     </div>
 
-    <!-- Move face modal -->
-    <div id="move-modal" class="modal-overlay hidden">
-        <div class="modal card">
+    <!-- Move dialog -->
+    <div id="move-modal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Move face">
+        <div class="card dialog">
             <h2>Move face</h2>
-            <img id="move-preview" alt="">
-            <div class="move-options">
-                <label><input type="radio" name="move-target" value="existing" checked> Move to existing group:</label>
+            <img id="move-preview" alt="Face preview">
+            <div class="dialog-fields">
+                <label class="radio"><input type="radio" name="move-target" value="existing" checked> Move to existing group</label>
                 <select id="move-target-select"></select>
-                <label><input type="radio" name="move-target" value="new"> Create new group named:</label>
-                <input type="text" id="move-new-name" placeholder="e.g. John (leave empty for auto)">
+                <label class="radio"><input type="radio" name="move-target" value="new"> Create new group named</label>
+                <input type="text" id="move-new-name" placeholder="e.g. John (empty = auto)">
             </div>
-            <div class="actions">
-                <button id="move-cancel" class="secondary">Cancel</button>
-                <button id="move-confirm" class="primary">Move</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Lightbox -->
-    <div id="lightbox" class="modal-overlay hidden">
-        <div class="lightbox-content card">
-            <div class="lightbox-header">
-                <span id="lightbox-title"></span>
-                <button id="lightbox-close" class="secondary">&times;</button>
-            </div>
-            <img id="lightbox-img" alt="">
-            <div id="lightbox-sources"></div>
-            <div class="actions">
-                <button id="lightbox-move" class="secondary">Move face (M)</button>
-                <button id="lightbox-delete" class="danger">Delete face (Del)</button>
+            <div class="dialog-actions">
+                <button id="move-cancel" class="btn ghost">Cancel</button>
+                <button id="move-confirm" class="btn primary">Move</button>
             </div>
         </div>
     </div>
 
-    <script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <!-- Image viewer -->
+    <div id="lightbox" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Image viewer">
+        <div class="card viewer">
+            <div class="viewer-head">
+                <span id="lightbox-title" class="mono muted small"></span>
+                <button id="lightbox-close" class="icon-btn" aria-label="Close viewer">✕</button>
+            </div>
+            <div class="viewer-stage">
+                <button id="lightbox-prev" class="nav-btn" title="Previous">‹</button>
+                <img id="lightbox-img" alt="Preview">
+                <button id="lightbox-next" class="nav-btn" title="Next">›</button>
+            </div>
+            <div id="lightbox-counter" class="muted small viewer-counter"></div>
+            <div id="lightbox-sources" class="viewer-meta"></div>
+            <div class="dialog-actions viewer-actions">
+                <button id="lightbox-move" class="btn ghost">↔ Move (M)</button>
+                <button id="lightbox-delete" class="btn danger">✕ Delete (Del)</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=3"></script>
 </body>
 </html>

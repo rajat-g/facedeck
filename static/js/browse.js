@@ -11,10 +11,7 @@ async function browsePath(mode, initialdir) {
             body: JSON.stringify({ mode, initialdir }),
         });
         return data.path;
-    } catch (err) {
-        toastError(err.message);
-        return null;
-    }
+    } catch (err) { toastError(err.message); return null; }
 }
 
 export function initBrowse() {
@@ -27,6 +24,7 @@ export function initBrowse() {
             lines.push(path.replace(/\//g, "\\"));
             ta.value = lines.join("\n");
             saveSettings();
+            ta.dispatchEvent(new Event("change"));
         }
     });
 
