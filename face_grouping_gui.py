@@ -52,18 +52,6 @@ class FaceGroupingApp(tk.Tk):
             side="left"
         )
 
-        # Output text file
-        row2 = ttk.Frame(container)
-        row2.pack(fill="x", **padding)
-        ttk.Label(row2, text="Report file:").pack(side="left")
-        self.output_file_var = tk.StringVar(value="face_groups.txt")
-        ttk.Entry(row2, textvariable=self.output_file_var, width=60).pack(
-            side="left", padx=(6, 6)
-        )
-        ttk.Button(row2, text="Browse...", command=self._browse_output_file).pack(
-            side="left"
-        )
-
         # Database file
         row3 = ttk.Frame(container)
         row3.pack(fill="x", **padding)
@@ -187,15 +175,6 @@ class FaceGroupingApp(tk.Tk):
         if folder:
             self.output_faces_var.set(folder)
 
-    def _browse_output_file(self) -> None:
-        file_path = filedialog.asksaveasfilename(
-            title="Select report file",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-        )
-        if file_path:
-            self.output_file_var.set(file_path)
-
     def _browse_db_file(self) -> None:
         file_path = filedialog.asksaveasfilename(
             title="Select database file",
@@ -287,7 +266,6 @@ class FaceGroupingApp(tk.Tk):
             return
 
         output_faces = self.output_faces_var.get().strip() or "output_faces"
-        output_file = self.output_file_var.get().strip() or "face_groups.txt"
         db_file = self.db_file_var.get().strip() or "processing_state.db"
         threshold = self.threshold_var.get()
 
@@ -302,8 +280,6 @@ class FaceGroupingApp(tk.Tk):
                 "face_grouping_v5.py",
                 "--input_folder",
                 input_folder,
-                "--output_file",
-                output_file,
                 "--output_faces",
                 output_faces,
                 "--threshold",

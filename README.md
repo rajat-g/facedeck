@@ -44,6 +44,9 @@ Then open http://127.0.0.1:5000 in your browser.
 The web UI lets you:
 - Pick input folders (multiple supported) and DB file with native folder/file dialogs
 - Start grouping with a live progress bar, log, and a cancel button
+- Watch people stream in during the run (progress checkpoints every 100 photos / 20s)
+  — curation (move, delete, approve, undo) pauses during a run so checkpoints
+  can't clobber it, and unlocks when the run finishes
 - Browse people as a fast list (no images loaded up front — safe for thousands of photos)
 - Select a person to see counts, then explicitly choose per section:
   - Face crops: click "View on UI" for a paginated, lazy-loaded grid, or keep previews off
@@ -73,7 +76,6 @@ Full options:
 ```bash
 python face_grouping_v5.py \
     --input_folder /path/to/images \
-    --output_file face_groups.txt \
     --output_faces output_faces \
     --threshold 0.6 \
     --db_file processing_state.db
@@ -82,16 +84,14 @@ python face_grouping_v5.py \
 ### Parameters
 
 - `--input_folder`: (Required) Path to the folder containing images
-- `--output_file`: (Optional) Path to the output file (default: face_groups.txt)
 - `--output_faces`: (Optional) Directory to save cropped face images (default: output_faces)
 - `--threshold`: (Optional) Cosine similarity threshold for grouping (default: 0.6)
 - `--db_file`: (Optional) SQLite database file to track processed images (default: processing_state.db)
 
 ## Output
 
-1. `face_groups.txt`: Contains the list of images grouped by detected faces
-2. `output_faces/`: Directory containing subdirectories for each face group with cropped face images
-3. `processing_state.db`: SQLite database tracking processed files, groups, and per-photo face-tag boxes for incremental processing
+1. `output_faces/`: Directory containing subdirectories for each face group with cropped face images
+2. `processing_state.db`: SQLite database tracking processed files, groups, and per-photo face-tag boxes for incremental processing (use Export in the web UI for CSV/JSON reports)
 
 Face tags are recorded during grouping (normalised boxes + owning group per face).
 Tags follow renames and moves, survive "approve", and are hidden for trashed faces.

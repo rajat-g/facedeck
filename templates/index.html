@@ -62,16 +62,10 @@
                         </div>
                     </div>
                 </div>
-                <div class="grid-2">
-                    <div class="field">
-                        <label for="output-file">Report file</label>
-                        <input type="text" id="output-file" value="face_groups.txt">
-                    </div>
-                    <div class="field">
-                        <label for="threshold">Similarity threshold: <strong id="threshold-value">0.60</strong></label>
-                        <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
-                        <div class="range-hints"><span>Strict</span><span>Balanced</span><span>Lenient</span></div>
-                    </div>
+                <div class="field">
+                    <label for="threshold">Similarity threshold: <strong id="threshold-value">0.60</strong></label>
+                    <input type="range" id="threshold" min="0.3" max="0.9" step="0.01" value="0.6">
+                    <div class="range-hints"><span>Strict</span><span>Balanced</span><span>Lenient</span></div>
                 </div>
                 <div class="config-actions">
                     <button id="run-btn" class="btn primary"><span aria-hidden="true">▶</span> Start grouping</button>

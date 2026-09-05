@@ -3,6 +3,6 @@ C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe face_grouping_
 Then open http://127.0.0.1:5000
 
 CLI:
-python face_grouping_v5.py --input_folder C:\Media\Learning\insight_face_app\Test --output_file C:\Media\Learning\insight_face_app\Output\results.txt --output_faces C:\Media\Learning\insight_face_app\Output\faces
+python face_grouping_v5.py --input_folder C:\Media\Learning\insight_face_app\Test --output_faces C:\Media\Learning\insight_face_app\Output\faces
 
-python face_grouping_v5.py --input_folder "C:\Media\Iphone photos" --output_file C:\Media\Learning\insight_face_app\Output\results.txt --output_faces C:\Media\Learning\insight_face_app\Output\faces
+python face_grouping_v5.py --input_folder "C:\Media\Iphone photos" --output_faces C:\Media\Learning\insight_face_app\Output\faces

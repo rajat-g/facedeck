@@ -400,6 +400,30 @@ class PhotoTagsTestCase(unittest.TestCase):
         self.assertEqual(left, 0)
 
 
+class StreamingTestCase(unittest.TestCase):
+    def test_status_exposes_groups_version(self):
+        app.config["TESTING"] = True
+        body = app.test_client().get("/api/status").get_json()
+        self.assertIn("groups_version", body)
+        self.assertEqual(body["groups_version"], 0)
+        self.assertFalse(body["running"])
+
+    def test_db_has_busy_timeout_for_concurrent_readers(self):
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="facedeck-pragma-")
+        try:
+            db = str(Path(tmp) / "s.db")
+            conn = open_db(db)
+            try:
+                timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(timeout, 10000)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
 

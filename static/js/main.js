@@ -32,7 +32,7 @@ $("#theme-btn").addEventListener("click", () => {
     saveSettings();
 });
 
-for (const id of ["input-folders", "output-faces", "db-file", "output-file"]) {
+for (const id of ["input-folders", "output-faces", "db-file"]) {
     $(`#${id}`).addEventListener("change", () => { saveSettings(); updateConfigSummary(); });
 }
 $("#threshold").addEventListener("input", () => {

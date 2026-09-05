@@ -42,6 +42,7 @@ class RunState:
         self.error = None
         self.log = []
         self.cancel_requested = False
+        self.groups_version = 0
 
     def reset(self):
         with self.lock:
@@ -51,6 +52,7 @@ class RunState:
             self.error = None
             self.log = []
             self.cancel_requested = False
+            self.groups_version = 0
 
     def request_cancel(self):
         with self.lock:
@@ -75,6 +77,7 @@ class RunState:
                 "error": self.error,
                 "log": list(self.log[-30:]),
                 "cancel_requested": self.cancel_requested,
+                "groups_version": self.groups_version,
             }
 
 
@@ -165,7 +168,7 @@ def next_group_id(conn):
     return (row[0] or 0) + 1
 
 
-def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_file):
+def run_grouping(input_folders, output_faces_dir, threshold, db_file):
     try:
         log = run_state.add_log
         conn, processed_files, groups = load_processed_state(db_file)
@@ -204,6 +207,11 @@ def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_fil
         id_counter = max(
             (g["id"] for g in groups if isinstance(g.get("id"), int)), default=0
         )
+
+        # Streaming checkpoints: persist every 100 images or 20s so the UI
+        # can show people as they are found instead of only at the end.
+        last_checkpoint = time.time()
+        since_checkpoint = 0
 
         for img_path in new_files:
             if run_state.cancel_requested:
@@ -290,16 +298,21 @@ def run_grouping(input_folders, output_file, output_faces_dir, threshold, db_fil
             finally:
                 with run_state.lock:
                     run_state.processed += 1
+                since_checkpoint += 1
+                now = time.time()
+                if since_checkpoint >= 100 or now - last_checkpoint >= 20.0:
+                    try:
+                        save_processed_state(conn, processed_files, groups)
+                        last_checkpoint = now
+                        since_checkpoint = 0
+                        with run_state.lock:
+                            run_state.groups_version += 1
+                        log(f"Checkpoint saved — {len(groups)} people so far.")
+                    except Exception as exc:
+                        log(f"Checkpoint save failed: {exc}")
 
         save_processed_state(conn, processed_files, groups)
         conn.close()
-
-        with open(output_file, "w") as f:
-            for i, group in enumerate(groups):
-                f.write(f"face {i + 1} (cropped faces in: {group['directory']}):\n")
-                for path in sorted(group["image_paths"]):
-                    f.write(f"{path}\n")
-                f.write("\n")
 
         run_state.add_log("Processing completed.")
     except Exception as exc:
@@ -331,7 +344,6 @@ def api_run():
     seen = set()
     input_folders = [p for p in input_folders if not (p in seen or seen.add(p))]
 
-    output_file = (data.get("output_file") or "").strip() or "face_groups.txt"
     output_faces = (data.get("output_faces") or "").strip() or "output_faces"
     db_file = (data.get("db_file") or "").strip() or "processing_state.db"
     try:
@@ -345,13 +357,12 @@ def api_run():
     if missing:
         return jsonify({"error": f"Folders do not exist: {', '.join(missing)}"}), 400
 
-    for file_path in (db_file, output_file):
-        parent = Path(file_path).parent
-        if str(parent):
-            try:
-                parent.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                return jsonify({"error": f"Cannot create folder for {file_path}: {exc}"}), 400
+    parent = Path(db_file).parent
+    if str(parent):
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return jsonify({"error": f"Cannot create folder for {db_file}: {exc}"}), 400
 
     snap = run_state.snapshot()
     if snap["running"]:
@@ -360,7 +371,7 @@ def api_run():
     run_state.reset()
     thread = threading.Thread(
         target=run_grouping,
-        args=(input_folders, output_file, output_faces, threshold, db_file),
+        args=(input_folders, output_faces, threshold, db_file),
         daemon=True,
     )
     thread.start()

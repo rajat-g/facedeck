@@ -117,6 +117,65 @@ export async function loadGroups() {
     updateBulkBar();
 }
 
+/* Lightweight refresh used while a run streams checkpoints: updates the
+   people list, stats and detail counts WITHOUT touching open image
+   viewers, selection focus or the name input. */
+export async function refreshPeopleList() {
+    let data;
+    try {
+        data = await api("/api/groups?summary=1");
+    } catch (_) {
+        return;
+    }
+    state.groups = data.groups || [];
+    pruneSelection();
+
+    if (state.selectedId == null) {
+        const first = filteredGroups()[0];
+        if (first) {
+            state.selectedId = first.id;
+            resetViewers();
+            renderDetail();
+        }
+    } else if (!state.groups.some((g) => g.id === state.selectedId)) {
+        state.selectedId = null;
+        resetViewers();
+        renderDetail();
+    } else {
+        updateDetailCounts();
+    }
+    renderPeople();
+    updateBulkBar();
+    loadStats();
+}
+
+/* Patch counts/badges in the open detail pane in place (never rebuilds
+   inputs or viewers, so focus and loaded images survive streaming). */
+function updateDetailCounts() {
+    const g = selectedGroup();
+    const pane = $("#person-detail");
+    if (!g || !pane || !pane.querySelector(".detail-name")) return;
+    const approved = g.face_count === 0 && g.photo_count > 0;
+    const badges = pane.querySelector(".badges");
+    if (badges) {
+        badges.innerHTML =
+            `<span class="badge">${g.face_count} faces</span>` +
+            `<span class="badge">${g.photo_count} photos</span>` +
+            `<span class="badge ${approved ? "approved" : "pending"}">` +
+            `${approved ? "✓ Approved" : "Pending"}</span>`;
+    }
+    const facesCount = pane.querySelector("#faces-section .count");
+    if (facesCount) facesCount.textContent = g.face_count;
+    const photosCount = pane.querySelector("#photos-section .count");
+    if (photosCount) photosCount.textContent = g.photo_count;
+    const toggle = pane.querySelector(".faces-toggle");
+    if (toggle && !state.faces.visible) {
+        toggle.textContent = g.face_count ? "View on UI" : "View";
+    }
+    const approveBtn = pane.querySelector(".approve-one");
+    if (approveBtn) approveBtn.disabled = g.face_count === 0;
+}
+
 async function loadStats() {
     let stats;
     try { stats = await api("/api/stats"); } catch (_) { return; }
@@ -280,6 +339,7 @@ function renderDetail() {
             <button class="btn copy-paths" title="Copy all source photo paths">⧉ Copy paths</button>
             <button class="btn open-folder" title="Open this person's folder in Explorer">🗁 Open folder</button>
             <button class="btn ${approved ? "" : "success"} approve-one" ${g.face_count === 0 ? "disabled" : ""} title="Approve — permanently delete cropped faces">✓ Approve</button>
+            <span class="run-lock-note" title="Move, delete, approve and undo are paused while a grouping run is in progress">⏸ Curation paused during run</span>
         </div>
         <div class="section" id="faces-section">
             <div class="section-head">

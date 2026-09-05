@@ -1,9 +1,21 @@
-/* Server API operations */
+/* Server API operations.
+   Mutations are blocked while a grouping run is in progress: the runner
+   checkpoints its in-memory state over the DB, which would clobber
+   concurrent curation. Renames are exempt (checkpoint preserves them). */
 
-import { api, getDbFile } from "./core.js";
+import { api, getDbFile, isRunning } from "./core.js";
 import { toastError } from "./toast.js";
 
+function blockedByRun() {
+    if (isRunning()) {
+        toastError("A grouping run is in progress — curation unlocks when it finishes.");
+        return true;
+    }
+    return false;
+}
+
 export async function deleteFaces(items) {
+    if (blockedByRun()) return null;
     try {
         return await api("/api/faces/bulk-delete", {
             method: "POST",
@@ -14,6 +26,7 @@ export async function deleteFaces(items) {
 }
 
 export async function moveFaces(items, targetGroupId, newGroupName = "") {
+    if (blockedByRun()) return null;
     try {
         return await api("/api/faces/bulk-move", {
             method: "POST",
@@ -24,6 +37,7 @@ export async function moveFaces(items, targetGroupId, newGroupName = "") {
 }
 
 export async function undoLast() {
+    if (blockedByRun()) return null;
     try {
         return await api("/api/undo", {
             method: "POST",
@@ -44,6 +58,7 @@ export async function renameGroup(groupId, name) {
 }
 
 export async function approveGroup(groupId) {
+    if (blockedByRun()) return null;
     try {
         return await api(`/api/groups/${groupId}/approve`, {
             method: "POST",
@@ -54,6 +69,7 @@ export async function approveGroup(groupId) {
 }
 
 export async function approveAllGroups() {
+    if (blockedByRun()) return null;
     try {
         return await api("/api/groups/approve-all", {
             method: "POST",

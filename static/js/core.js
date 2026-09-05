@@ -26,6 +26,10 @@ export const state = {
 
 export const $ = (sel) => document.querySelector(sel);
 
+export function isRunning() {
+    return document.body.classList.contains("is-running");
+}
+
 export function getDbFile() {
     return $("#db-file").value.trim() || "processing_state.db";
 }
@@ -102,7 +106,6 @@ export function loadSettings() {
     if (saved.inputFolders) $("#input-folders").value = saved.inputFolders;
     if (saved.outputFaces) $("#output-faces").value = saved.outputFaces;
     if (saved.dbFile) $("#db-file").value = saved.dbFile;
-    if (saved.outputFile) $("#output-file").value = saved.outputFile;
     if (saved.threshold) {
         $("#threshold").value = saved.threshold;
         $("#threshold-value").textContent = parseFloat(saved.threshold).toFixed(2);
@@ -121,7 +124,6 @@ export function saveSettings() {
             inputFolders: $("#input-folders").value,
             outputFaces: $("#output-faces").value,
             dbFile: getDbFile(),
-            outputFile: $("#output-file").value,
             threshold: $("#threshold").value,
             theme: document.documentElement.dataset.theme || "dark",
             configCollapsed: $("#config-panel").classList.contains("collapsed"),

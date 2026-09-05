@@ -78,6 +78,8 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     # Write-ahead logging: readers (web UI) no longer block while a run writes
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    # Readers poll frequently during runs; wait instead of failing busy.
+    cursor.execute("PRAGMA busy_timeout=10000")
 
     cursor.execute(
         """
@@ -306,11 +308,6 @@ def main():
         help="Path to the folder containing images",
     )
     parser.add_argument(
-        "--output_file",
-        default="face_groups.txt",
-        help="Path to the output file",
-    )
-    parser.add_argument(
         "--output_faces",
         default="output_faces",
         help="Directory to save cropped face images",
@@ -444,13 +441,8 @@ def main():
     save_processed_state(conn, processed_files, groups)
     conn.close()
 
-    # Write output
-    with open(args.output_file, 'w') as f:
-        for i, group in enumerate(groups):
-            f.write(f"face {i+1} (cropped faces in: {group['directory']}):\n")
-            for path in sorted(group['image_paths']):
-                f.write(f"{path}\n")
-            f.write("\n")
+    print(f"Done. {len(groups)} group(s) in '{output_faces_dir}', state in '{args.db_file}'.")
+    print("Use the web UI export (CSV/JSON) for a portable report.")
 
 if __name__ == '__main__':
     main()
