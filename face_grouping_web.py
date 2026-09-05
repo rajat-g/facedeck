@@ -168,6 +168,46 @@ def next_group_id(conn):
     return (row[0] or 0) + 1
 
 
+def describe_run_target(db_file, input_folders):
+    """Facts about a planned run, used for fresh-DB / folder-mismatch warnings.
+
+    Pure reads only — safe to call from tests and the API without starting
+    any processing.
+    """
+    resolved_db = str(Path(db_file).resolve())
+    resolved_folders = sorted(str(Path(p).resolve()) for p in input_folders)
+    info = {
+        "resolved_db": resolved_db,
+        "resolved_folders": resolved_folders,
+        "fresh_db": True,
+        "existing_people": 0,
+        "folder_mismatch": False,
+        "last_input_folders": [],
+    }
+    if not Path(db_file).exists():
+        return info
+    try:
+        mconn = open_db(db_file)
+        try:
+            info["fresh_db"] = False
+            info["existing_people"] = mconn.execute(
+                "SELECT COUNT(*) FROM groups"
+            ).fetchone()[0]
+            row = mconn.execute(
+                "SELECT value FROM run_meta WHERE key='last_input_folders'"
+            ).fetchone()
+            if row and row[0]:
+                info["last_input_folders"] = json.loads(row[0])
+                info["folder_mismatch"] = (
+                    sorted(info["last_input_folders"]) != resolved_folders
+                )
+        finally:
+            mconn.close()
+    except Exception:
+        pass
+    return info
+
+
 def run_grouping(input_folders, output_faces_dir, threshold, db_file):
     try:
         log = run_state.add_log
@@ -200,6 +240,23 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
             f"Found {len(new_files)} new/changed image(s) "
             f"({total_files} image(s) total in folder)"
         )
+        log(f"Database: {Path(db_file).resolve()} — "
+            f"resuming with {len(groups)} existing people.")
+        try:
+            prev_row = conn.execute(
+                "SELECT value FROM run_meta WHERE key='last_input_folders'"
+            ).fetchone()
+            if prev_row and prev_row[0]:
+                prev_folders = sorted(json.loads(prev_row[0]))
+                cur_folders = sorted(
+                    str(Path(p).resolve()) for p in input_folders
+                )
+                if prev_folders and prev_folders != cur_folders:
+                    log("WARNING: input folders differ from the last run on "
+                        "this database. Groups from other folders stay, but "
+                        "only the folders above will be scanned.")
+        except Exception as exc:
+            log(f"Could not check last input folders: {exc}")
 
         matchable = [
             g for g in groups if g["sum_embedding"] is not None and g["count"] > 0
@@ -312,6 +369,11 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
                         log(f"Checkpoint save failed: {exc}")
 
         save_processed_state(conn, processed_files, groups)
+        conn.execute(
+            "INSERT OR REPLACE INTO run_meta(key, value) VALUES ('last_input_folders', ?)",
+            (json.dumps(sorted(str(Path(p).resolve()) for p in input_folders)),),
+        )
+        conn.commit()
         conn.close()
 
         run_state.add_log("Processing completed.")
@@ -368,6 +430,8 @@ def api_run():
     if snap["running"]:
         return jsonify({"error": "Processing is already running"}), 409
 
+    target = describe_run_target(db_file, input_folders)
+
     run_state.reset()
     thread = threading.Thread(
         target=run_grouping,
@@ -375,7 +439,16 @@ def api_run():
         daemon=True,
     )
     thread.start()
-    return jsonify({"started": True})
+    return jsonify(
+        {
+            "started": True,
+            "fresh_db": target["fresh_db"],
+            "existing_people": target["existing_people"],
+            "folder_mismatch": target["folder_mismatch"],
+            "resolved_db": target["resolved_db"],
+            "resolved_folders": target["resolved_folders"],
+        }
+    )
 
 
 @app.route("/api/cancel", methods=["POST"])

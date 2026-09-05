@@ -3,7 +3,7 @@
    curation stays locked until the run finishes (see ops.js). */
 
 import { $, api, saveSettings, state } from "./core.js";
-import { toastError } from "./toast.js";
+import { toast, toastError } from "./toast.js";
 import { refreshPeopleList } from "./groups.js";
 
 let refresh = () => {};
@@ -19,8 +19,9 @@ async function startRun() {
     const folders = $("#input-folders").value.split("\n").map((l) => l.trim()).filter(Boolean);
     if (folders.length === 0) { toastError("Add at least one input folder."); return; }
 
+    let started;
     try {
-        await api("/api/run", {
+        started = await api("/api/run", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -31,6 +32,14 @@ async function startRun() {
             }),
         });
     } catch (err) { toastError(err.message); return; }
+
+    const dbShort = (started.resolved_db || $("#db-file").value.trim()).length > 42
+        ? "…" + (started.resolved_db || $("#db-file").value.trim()).slice(-41)
+        : (started.resolved_db || $("#db-file").value.trim());
+    let msg = `Run started — ${started.existing_people ?? 0} existing people in ${dbShort}.`;
+    if (started.fresh_db) msg += " NEW database file: no previous results here.";
+    if (started.folder_mismatch) msg += " Folders differ from this database's last run.";
+    toast(msg, "info", 6500);
 
     saveSettings();
     $("#run-btn").disabled = true;

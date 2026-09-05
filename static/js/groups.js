@@ -12,6 +12,7 @@ import {
     basename,
     escapeHtml,
     faceUrl,
+    getDbFile,
     initials,
     saveSettings,
     sourceUrl,
@@ -266,7 +267,9 @@ function renderPeople() {
     empty.classList.toggle("hidden", !isEmpty);
     if (isEmpty) {
         empty.innerHTML = state.groups.length === 0
-            ? `<div class="empty-ico">⊘</div><h3>No groups yet</h3><p class="muted">Run grouping or click Refresh to load existing results.</p>`
+            ? `<div class="empty-ico">⊘</div><h3>No groups yet</h3>` +
+              `<p class="muted">Run grouping or click Refresh to load existing results.</p>` +
+              `<p class="muted small mono" title="Active database file">DB: ${escapeHtml(getDbFile())}</p>`
             : `<div class="empty-ico">⊘</div><h3>No matches</h3><p class="muted">Try clearing the search or status filter.</p>`;
     }
 

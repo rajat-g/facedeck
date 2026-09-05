@@ -159,6 +159,15 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     )
 
     cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_group_image_paths_image_path "
         "ON group_image_paths(image_path)"
     )
@@ -205,9 +214,13 @@ def load_processed_state(db_path):
         processed_files[file_path] = (mtime, size)
 
     groups = []
-    for group_id, sum_embedding_str, count, directory, name in cursor.execute(
+    # NOTE: buffer the outer rows first — the per-group queries below reuse
+    # this cursor, and re-executing on it would discard the outer result set
+    # (this once silently dropped every group but the first on every re-run).
+    group_rows = cursor.execute(
         "SELECT id, sum_embedding, count, directory, name FROM groups ORDER BY id"
-    ):
+    ).fetchall()
+    for group_id, sum_embedding_str, count, directory, name in group_rows:
         if sum_embedding_str:
             sum_embedding = np.fromstring(sum_embedding_str, sep=",", dtype=np.float32)
         else:

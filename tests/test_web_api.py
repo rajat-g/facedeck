@@ -400,6 +400,126 @@ class PhotoTagsTestCase(unittest.TestCase):
         self.assertEqual(left, 0)
 
 
+class RunTargetTestCase(unittest.TestCase):
+    """describe_run_target: fresh-DB and folder-mismatch warnings."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-target-"))
+        self.folder_a = self.tmp / "a"
+        self.folder_b = self.tmp / "b"
+        self.folder_a.mkdir()
+        self.folder_b.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_fresh_db(self):
+        from face_grouping_web import describe_run_target
+
+        info = describe_run_target(
+            str(self.tmp / "new.db"), [str(self.folder_a)]
+        )
+        self.assertTrue(info["fresh_db"])
+        self.assertEqual(info["existing_people"], 0)
+        self.assertFalse(info["folder_mismatch"])
+        self.assertEqual(info["resolved_folders"], [str(self.folder_a.resolve())])
+
+    def test_existing_db_reports_people_and_mismatch(self):
+        from face_grouping_web import describe_run_target
+
+        db = self.tmp / "state.db"
+        conn = open_db(str(db))
+        conn.execute(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (1, '', 1, 'C:/x/g1', 'Alice')"
+        )
+        conn.execute(
+            "INSERT INTO run_meta(key, value) VALUES ('last_input_folders', ?)",
+            (json.dumps([str(self.folder_a.resolve())]),),
+        )
+        conn.commit()
+        conn.close()
+
+        same = describe_run_target(str(db), [str(self.folder_a)])
+        self.assertFalse(same["fresh_db"])
+        self.assertEqual(same["existing_people"], 1)
+        self.assertFalse(same["folder_mismatch"])
+
+        other = describe_run_target(str(db), [str(self.folder_b)])
+        self.assertTrue(other["folder_mismatch"])
+        self.assertEqual(other["existing_people"], 1)
+
+
+class LoadSaveRoundTripTestCase(unittest.TestCase):
+    """load_processed_state must return EVERY group (cursor-reuse regression).
+
+    The per-group queries reuse the same cursor as the outer groups query;
+    streaming the outer rows while re-executing silently dropped every group
+    but the first on each re-run, collapsing the DB down to 1-2 groups.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-roundtrip-"))
+        self.db_file = self.tmp / "state.db"
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, '1.0,2.0', 2, ?, ?)",
+            [
+                (1, "C:/x/group_1", "Alice"),
+                (2, "C:/x/group_2", None),
+                (3, "C:/x/group_3", "Carol"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO group_image_paths VALUES (?, ?)",
+            [(1, "C:/p/a.jpg"), (2, "C:/p/b.jpg"), (3, "C:/p/c.jpg")],
+        )
+        conn.executemany(
+            "INSERT INTO group_cropped_faces VALUES (?, ?)",
+            [(1, "a_0"), (2, "b_0"), (3, "c_0")],
+        )
+        conn.executemany(
+            "INSERT INTO processed_files VALUES (?, ?, ?)",
+            [(f"C:/p/{c}.jpg", 1.0, 10) for c in "abc"],
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_load_returns_all_groups(self):
+        from face_grouping_v5 import load_processed_state
+
+        conn, processed, groups = load_processed_state(str(self.db_file))
+        conn.close()
+        self.assertEqual([g["id"] for g in groups], [1, 2, 3])
+        by_id = {g["id"]: g for g in groups}
+        self.assertEqual(by_id[1]["name"], "Alice")
+        self.assertEqual(by_id[2]["name"], None)
+        self.assertEqual(by_id[3]["image_paths"], {"C:/p/c.jpg"})
+        self.assertEqual(by_id[2]["cropped_faces"], {"b_0"})
+        self.assertEqual(len(processed), 3)
+
+    def test_save_then_load_preserves_all_groups(self):
+        from face_grouping_v5 import (
+            load_processed_state,
+            save_processed_state,
+        )
+
+        conn, processed, groups = load_processed_state(str(self.db_file))
+        save_processed_state(conn, processed, groups)
+        conn.close()
+
+        conn2, processed2, groups2 = load_processed_state(str(self.db_file))
+        conn2.close()
+        self.assertEqual([g["id"] for g in groups2], [1, 2, 3])
+        names = {g["id"]: g["name"] for g in groups2}
+        self.assertEqual(names, {1: "Alice", 2: None, 3: "Carol"})
+        self.assertEqual(len(processed2), 3)
+
+
 class StreamingTestCase(unittest.TestCase):
     def test_status_exposes_groups_version(self):
         app.config["TESTING"] = True

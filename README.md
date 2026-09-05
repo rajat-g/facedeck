@@ -47,6 +47,9 @@ The web UI lets you:
 - Watch people stream in during the run (progress checkpoints every 100 photos / 20s)
   — curation (move, delete, approve, undo) pauses during a run so checkpoints
   can't clobber it, and unlocks when the run finishes
+- Starting a run states the resolved database path and existing people count,
+  and warns about a brand-new database or input folders that differ from the
+  database's last run (groups belong to the DB, not the folder)
 - Browse people as a fast list (no images loaded up front — safe for thousands of photos)
 - Select a person to see counts, then explicitly choose per section:
   - Face crops: click "View on UI" for a paginated, lazy-loaded grid, or keep previews off
