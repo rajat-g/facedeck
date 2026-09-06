@@ -770,17 +770,21 @@ def api_reveal_group_folder(group_id):
 @app.route("/api/groups/<int:group_id>/faces/<path:filename>")
 def api_face_image(group_id, filename):
     db_file = request.args.get("db_file", "processing_state.db")
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
     conn = open_db(db_file)
-    row = conn.execute(
-        "SELECT directory FROM groups WHERE id=?", (group_id,)
-    ).fetchone()
-    conn.close()
-    if row is None:
-        return jsonify({"error": "Group not found"}), 404
-    directory = Path(row["directory"])
-    if not directory.is_dir():
-        return jsonify({"error": "Group directory missing"}), 404
-    return send_from_directory(directory, filename)
+    try:
+        row = conn.execute(
+            "SELECT directory FROM groups WHERE id=?", (group_id,)
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Group not found"}), 404
+        directory = Path(row["directory"])
+        if not directory.is_dir():
+            return jsonify({"error": "Group directory missing"}), 404
+        return send_from_directory(directory, filename)
+    finally:
+        conn.close()
 
 
 @app.route("/api/groups/<int:group_id>/rename", methods=["POST"])
@@ -1422,53 +1426,55 @@ def api_source_image():
         return jsonify({"error": "Database file does not exist"}), 404
 
     conn = open_db(db_file)
-    allowed = conn.execute(
-        "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
-        (group_id, path),
-    ).fetchone()
-    conn.close()
+    try:
+        allowed = conn.execute(
+            "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
+            (group_id, path),
+        ).fetchone()
 
-    if not allowed or not Path(path).is_file():
-        return jsonify({"error": "Image not found"}), 404
+        if not allowed or not Path(path).is_file():
+            return jsonify({"error": "Image not found"}), 404
 
-    # HEIC/HEIF need conversion for browser preview (Chrome/Firefox don't render HEIC)
-    if path.lower().endswith((".heic", ".heif")):
+        # HEIC/HEIF need conversion for browser preview (Chrome/Firefox don't render HEIC)
+        if path.lower().endswith((".heic", ".heif")):
+            try:
+                img = read_image(path)
+                if img is None:
+                    return jsonify({"error": "Could not decode HEIC image"}), 500
+                ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ok:
+                    return jsonify({"error": "HEIC conversion failed"}), 500
+                return send_file(
+                    io.BytesIO(buf.tobytes()),
+                    mimetype="image/jpeg",
+                    as_attachment=False,
+                    download_name=Path(path).stem + ".jpg",
+                    max_age=3600,
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                return jsonify({"error": f"HEIC preview failed: {exc}"}), 500
+
+        # Photos with an EXIF orientation flag are served transposed so the
+        # displayed pixels match detection space (face-tag boxes stay correct).
+        # Anything else takes the fast path: original bytes, zero overhead.
         try:
-            img = read_image(path)
-            if img is None:
-                return jsonify({"error": "Could not decode HEIC image"}), 500
-            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            if not ok:
-                return jsonify({"error": "HEIC conversion failed"}), 500
+            converted = _oriented_jpeg_bytes(path)
+        except Exception:
+            traceback.print_exc()
+            converted = None
+        if converted is not None:
             return send_file(
-                io.BytesIO(buf.tobytes()),
+                io.BytesIO(converted),
                 mimetype="image/jpeg",
                 as_attachment=False,
                 download_name=Path(path).stem + ".jpg",
                 max_age=3600,
             )
-        except Exception as exc:
-            traceback.print_exc()
-            return jsonify({"error": f"HEIC preview failed: {exc}"}), 500
 
-    # Photos with an EXIF orientation flag are served transposed so the
-    # displayed pixels match detection space (face-tag boxes stay correct).
-    # Anything else takes the fast path: original bytes, zero overhead.
-    try:
-        converted = _oriented_jpeg_bytes(path)
-    except Exception:
-        traceback.print_exc()
-        converted = None
-    if converted is not None:
-        return send_file(
-            io.BytesIO(converted),
-            mimetype="image/jpeg",
-            as_attachment=False,
-            download_name=Path(path).stem + ".jpg",
-            max_age=3600,
-        )
-
-    return send_file(path, max_age=3600)
+        return send_file(path, max_age=3600)
+    finally:
+        conn.close()
 
 
 def _oriented_jpeg_bytes(path):

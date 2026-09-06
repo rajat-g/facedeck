@@ -268,6 +268,12 @@ class WebApiTestCase(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 404)
 
+    def test_face_image_missing_db_is_404_without_creating_file(self):
+        ghost = self.tmp / "ghost.db"
+        resp = self.client.get(f"/api/groups/1/faces/a.jpg?db_file={ghost.as_posix()}")
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(ghost.exists(), "read path must not create a database")
+
     def test_run_validation_missing_folders(self):
         resp = self.client.post(
             "/api/run",
