@@ -1,6 +1,7 @@
 import json
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -933,6 +934,250 @@ class PhotoFollowTestCase(unittest.TestCase):
         self.assertEqual(
             self.client.post("/api/groups/2/approve", json=self.db).status_code, 200)
         self.assertEqual(self.paths_of(2), [self.P3])
+
+
+class DuplicatesTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-dup-"))
+        self.db_file = self.tmp / "state.db"
+        self.out_root = self.tmp / "out"
+        self.g1 = self.out_root / "group_1"
+        self.g1.mkdir(parents=True)
+        make_face_file(self.g1, "a_0.jpg")
+        conn = open_db(str(self.db_file))
+        conn.execute(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (1, '', 1, ?, 'Alice')",
+            (str(self.g1),),
+        )
+        conn.execute("INSERT INTO group_image_paths VALUES (1, 'C:/p/orig.jpg')")
+        conn.execute("INSERT INTO group_cropped_faces VALUES (1, 'a_0')")
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES ('C:/p/orig.jpg', 0, 'a_0', 0.1, 0.1, 0.2, 0.2, 1, 0)"
+        )
+        # orig.jpg <-> copy.jpg are bit-identical; copy is the alias.
+        conn.execute(
+            "INSERT INTO file_hashes(path, mtime, size, sha256, phash) VALUES "
+            "('C:/p/orig.jpg', 1.0, 10, 'SAMESHA', '0000000000000000'), "
+            "('C:/p/copy.jpg', 1.0, 10, 'SAMESHA', '0000000000000000')"
+        )
+        conn.execute(
+            "INSERT INTO duplicates(dup_path, canonical_path) VALUES ('C:/p/copy.jpg', 'C:/p/orig.jpg')"
+        )
+        # near-dupe candidates with known distances (1 vs 63 bits).
+        conn.execute(
+            "INSERT INTO file_hashes(path, mtime, size, sha256, phash) VALUES "
+            "('C:/s/a.jpg', 1.0, 10, 'shaA', '0000000000000000'), "
+            "('C:/s/b.jpg', 1.0, 10, 'shaB', '0000000000000001'), "
+            "('C:/s/c.jpg', 1.0, 10, 'shaC', 'ffffffffffffffff')"
+        )
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            (self.tmp / name).write_bytes(b"x")
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+        self.db = {"db_file": str(self.db_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_union_listing_counts_and_aliases(self):
+        body = self.client.get(f"/api/groups?{self.q}").get_json()["groups"]
+        self.assertEqual(body[0]["photo_count"], 2)
+        self.assertEqual(body[0]["image_paths"],
+                         ["C:/p/copy.jpg", "C:/p/orig.jpg"])
+        page = self.client.get(f"/api/groups/1/photos?{self.q}").get_json()
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(page["aliases"], {"C:/p/copy.jpg": "C:/p/orig.jpg"})
+
+    def test_tags_and_guards_follow_alias(self):
+        real = self.tmp / "copy.jpg"
+        real.write_bytes(b"\xff\xd8fakejpg")
+        conn = open_db(str(self.db_file))
+        conn.execute("UPDATE duplicates SET dup_path=? WHERE dup_path='C:/p/copy.jpg'",
+                     (real.as_posix(),))
+        conn.commit()
+        conn.close()
+        tags = self.client.get(
+            f"/api/photo-tags?{self.q}&group_id=1&path={real.as_posix()}").get_json()
+        self.assertEqual(len(tags["tags"]), 1)
+        self.assertEqual(tags["tags"][0]["face_id"], "a_0")
+        self.assertEqual(tags["duplicate_of"], "C:/p/orig.jpg")
+        resp = self.client.get(
+            f"/api/source-image?{self.q}&group_id=1&path={real.as_posix()}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("image/jpeg", resp.content_type)
+
+    def test_delete_alias_recycles_and_keeps_canonical(self):
+        from unittest import mock
+
+        target = self.tmp / "copy.jpg"
+        target.write_bytes(b"same-bytes")
+        conn = open_db(str(self.db_file))
+        conn.execute("UPDATE duplicates SET dup_path=? WHERE dup_path='C:/p/copy.jpg'",
+                     (str(target),))
+        conn.execute("UPDATE file_hashes SET path=? WHERE path='C:/p/copy.jpg'",
+                     (str(target),))
+        conn.commit()
+        conn.close()
+        with mock.patch("face_grouping_web.send2trash") as st:
+            st.side_effect = lambda p: Path(p).unlink()
+            resp = self.client.delete(
+                "/api/duplicates",
+                json={"paths": [str(target)], **self.db},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["deleted"], [str(target)])
+        st.assert_called_once_with(str(target))
+        self.assertFalse(target.exists())
+        groups = self.client.get(f"/api/groups?{self.q}").get_json()["groups"]
+        self.assertEqual(groups[0]["photo_count"], 1)  # canonical alone again
+
+    def test_delete_rejects_canonical(self):
+        resp = self.client.delete(
+            "/api/duplicates", json={"paths": ["C:/p/orig.jpg"], **self.db})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["deleted"], [])
+        self.assertTrue(body["errors"])
+
+    def test_link_unlink_round_trip(self):
+        link = self.client.post(
+            "/api/duplicates/link",
+            json={"dup": "C:/s/b.jpg", "canonical": "C:/p/orig.jpg", **self.db})
+        self.assertEqual(link.status_code, 200)
+        tags = self.client.get(
+            f"/api/photo-tags?{self.q}&group_id=1&path=C:/s/b.jpg").get_json()
+        self.assertEqual(tags["duplicate_of"], "C:/p/orig.jpg")
+        self.assertEqual(len(tags["tags"]), 1)
+        groups = {g["id"]: g for g in
+                  self.client.get(f"/api/groups?{self.q}").get_json()["groups"]}
+        self.assertIn("C:/s/b.jpg", groups[1]["image_paths"])
+        undo = self.client.post(
+            "/api/duplicates/link",
+            json={"unlink": True, "dup": "C:/s/b.jpg", **self.db})
+        self.assertEqual(undo.status_code, 200)
+        groups = {g["id"]: g for g in
+                  self.client.get(f"/api/groups?{self.q}").get_json()["groups"]}
+        self.assertNotIn("C:/s/b.jpg", groups[1]["image_paths"])
+        # b has no tag rows of its own, so it drops out entirely again.
+        self.assertEqual(
+            self.client.get(f"/api/photo-tags?{self.q}&group_id=1&path=C:/s/b.jpg").status_code,
+            404)
+
+    def test_scan_finds_near_not_exact_nor_dismissed(self):
+        # Real files with crafted perceptual hashes (distances 1 vs 63).
+        pa, pb, pc = (str(self.tmp / n) for n in ("na.jpg", "nb.jpg", "nc.jpg"))
+        for p in (pa, pb, pc):
+            Path(p).write_bytes(b"x")
+        conn = open_db(str(self.db_file))
+        conn.execute("DELETE FROM file_hashes WHERE path LIKE 'C:/s/%'")
+        conn.executemany(
+            "INSERT INTO file_hashes(path, mtime, size, sha256, phash) VALUES (?, 1.0, 10, ?, ?)",
+            [(pa, "shaA", "0000000000000000"),
+             (pb, "shaB", "0000000000000001"),
+             (pc, "shaC", "ffffffffffffffff")],
+        )
+        conn.commit()
+        conn.close()
+        scan = self.client.post(
+            "/api/duplicates/scan", json={**self.db, "threshold": 10})
+        self.assertEqual(scan.status_code, 200)
+        body = scan.get_json()
+        self.assertEqual(body["scanned"], 3)
+        self.assertEqual(len(body["sets"]), 1)
+        members = sorted(p["path"] for p in body["sets"][0]["photos"])
+        self.assertEqual(members, sorted((pa, pb)))
+        dist = body["sets"][0]["pairs"][0][2]
+        self.assertEqual(dist, 1)
+        # Dismiss hides it; undismiss brings it back.
+        self.client.post("/api/duplicates/dismiss",
+                         json={"pairs": [[pa, pb]], **self.db})
+        again = self.client.post(
+            "/api/duplicates/scan", json={**self.db, "threshold": 10}).get_json()
+        self.assertEqual(again["sets"], [])
+        self.client.post("/api/duplicates/dismiss",
+                         json={"pairs": [[pa, pb]], "undismiss": True, **self.db})
+        back = self.client.post(
+            "/api/duplicates/scan", json={**self.db, "threshold": 10}).get_json()
+        self.assertEqual(len(back["sets"]), 1)
+
+    def test_pipeline_skips_and_links_exact_duplicate(self):
+        import numpy as np
+
+        calls = []
+
+        class FakeFace:
+            def __init__(self):
+                self.embedding = np.ones(512, dtype=np.float32)
+                self.bbox = np.array([10.0, 10.0, 50.0, 50.0])
+
+        class FakeApp:
+            def get(self, img):
+                calls.append(1)
+                return [FakeFace()]
+
+        from PIL import Image
+
+        import face_grouping_web as webmod
+
+        d1, d2 = self.tmp / "w1", self.tmp / "w2"
+        d1.mkdir()
+        d2.mkdir()
+        Image.new("RGB", (100, 100), (10, 200, 30)).save(d1 / "same.jpg", "JPEG")
+        shutil.copy(d1 / "same.jpg", d2 / "same.jpg")
+        old = webmod.get_face_app
+        webmod.get_face_app = lambda: FakeApp()
+        try:
+            db2 = self.tmp / "pipe.db"
+            out2 = self.tmp / "pout"
+            r = self.client.post("/api/run", json={
+                "input_folders": [str(d1), str(d2)],
+                "output_faces": str(out2),
+                "db_file": str(db2), "threshold": 0.6})
+            self.assertEqual(r.status_code, 200)
+            for _ in range(90):
+                time.sleep(1)
+                if not self.client.get("/api/status").get_json()["running"]:
+                    break
+            self.assertEqual(len(calls), 1, "duplicate must skip detection")
+            groups = self.client.get(
+                f"/api/groups?db_file={db2.as_posix()}").get_json()["groups"]
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(groups[0]["image_paths"]), 2)
+            dupes = self.client.get(
+                f"/api/duplicates?db_file={db2.as_posix()}").get_json()["sets"]
+            self.assertEqual(len(dupes), 1)
+            self.assertEqual(len(dupes[0]["duplicates"]), 1)
+        finally:
+            webmod.get_face_app = old
+
+    def test_dhash_helpers(self):
+        from PIL import Image, ImageDraw
+
+        from face_grouping_v5 import dhash_of, sha256_of
+
+        def split(path, left, right):
+            img = Image.new("RGB", (64, 64), left)
+            ImageDraw.Draw(img).rectangle([32, 0, 64, 64], fill=right)
+            img.save(path, "PNG")
+
+        a = self.tmp / "h1.png"
+        b = self.tmp / "h2.png"
+        split(a, (0, 0, 0), (255, 255, 255))
+        shutil.copy(a, b)
+        self.assertEqual(sha256_of(str(a)), sha256_of(str(b)))
+        self.assertEqual(dhash_of(str(a)), dhash_of(str(b)))
+        split(b, (255, 255, 255), (0, 0, 0))  # inverted edge structure
+        self.assertNotEqual(sha256_of(str(a)), sha256_of(str(b)))
+        self.assertNotEqual(dhash_of(str(a)), dhash_of(str(b)))
+        bad = self.tmp / "bad.jpg"
+        bad.write_bytes(b"not-an-image-at-all")
+        self.assertIsNone(dhash_of(str(bad)))
+        self.assertIsNone(dhash_of(str(self.tmp / "missing.jpg")))
 
 
 if __name__ == "__main__":

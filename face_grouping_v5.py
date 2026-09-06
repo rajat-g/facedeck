@@ -76,6 +76,164 @@ def image_face_id(img_path, face_idx):
     digest = hashlib.sha1(parent.encode("utf-8")).hexdigest()[:8]
     return f"{Path(img_path).stem}_{digest}_{face_idx}"
 
+
+def sha256_of(file_path, chunk_size=1024 * 1024):
+    """Hex SHA-256 of file bytes, or None when unreadable."""
+    digest = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def dhash_of(file_path):
+    """64-bit perceptual hash (hex) via ImageHash, or None when undecodable."""
+    try:
+        import imagehash
+
+        if str(file_path).lower().endswith((".heic", ".heif")):
+            arr = read_image(str(file_path))
+            if arr is None:
+                return None
+            img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+            return str(imagehash.dhash(img))
+        with Image.open(file_path) as img:
+            return str(imagehash.dhash(ImageOps.exif_transpose(img)))
+    except Exception:
+        return None
+
+
+def resolve_canonical(conn, path):
+    """Follow duplicate aliases to the root canonical path (no chains)."""
+    seen = set()
+    cur = str(path)
+    while True:
+        if cur in seen:
+            return cur
+        seen.add(cur)
+        row = conn.execute(
+            "SELECT canonical_path FROM duplicates WHERE dup_path=?", (cur,)
+        ).fetchone()
+        if row is None:
+            return cur
+        cur = row[0]
+
+
+def check_duplicate(conn, path):
+    """Exact-duplicate check for a new/changed file.
+
+    Records content hashes; returns the root canonical path when this file
+    is bit-identical to another (and registers the alias), else None.
+    Unchanged files never reach here (discovery skips them first).
+    """
+    key = str(path)
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    row = conn.execute(
+        "SELECT mtime, size, sha256 FROM file_hashes WHERE path=?", (key,)
+    ).fetchone()
+    if row and (row[0], row[1]) == (st.st_mtime, st.st_size):
+        sha = row[2]
+    else:
+        sha = sha256_of(key)
+        phash = dhash_of(key)
+        conn.execute(
+            "INSERT OR REPLACE INTO file_hashes(path, mtime, size, sha256, phash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (key, st.st_mtime, st.st_size, sha, phash),
+        )
+    if not sha:
+        conn.execute("DELETE FROM duplicates WHERE dup_path=?", (key,))
+        return None
+    cand = conn.execute(
+        "SELECT path FROM file_hashes WHERE sha256=? AND path != ? "
+        "ORDER BY path LIMIT 1",
+        (sha, key),
+    ).fetchone()
+    if cand is None:
+        conn.execute("DELETE FROM duplicates WHERE dup_path=?", (key,))
+        return None
+    # Only trust candidates whose file still matches its cached stat.
+    try:
+        cst = Path(cand[0]).stat()
+    except OSError:
+        return None
+    crow = conn.execute(
+        "SELECT mtime, size FROM file_hashes WHERE path=?", (cand[0],)
+    ).fetchone()
+    if not crow or (crow[0], crow[1]) != (cst.st_mtime, cst.st_size):
+        return None
+    root = resolve_canonical(conn, cand[0])
+    if root == key:
+        return None
+    conn.execute(
+        "INSERT OR REPLACE INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+        (key, root),
+    )
+    return root
+
+
+def photo_in_group(conn, group_id, image_path):
+    """Group membership, direct or inherited through a duplicate alias."""
+    if conn.execute(
+        "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
+        (group_id, image_path),
+    ).fetchone():
+        return True
+    return (
+        conn.execute(
+            "SELECT 1 FROM duplicates d "
+            "JOIN group_image_paths g ON g.image_path = d.canonical_path "
+            "AND g.group_id=? WHERE d.dup_path=?",
+            (group_id, image_path),
+        ).fetchone()
+        is not None
+    )
+
+
+def group_photos_with_dupes(conn, group_id):
+    """Sorted group photos: direct links plus inherited duplicates."""
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT image_path FROM group_image_paths WHERE group_id=? "
+            "UNION "
+            "SELECT d.dup_path FROM duplicates d "
+            "JOIN group_image_paths g ON g.image_path = d.canonical_path "
+            "AND g.group_id=? "
+            "ORDER BY 1",
+            (group_id, group_id),
+        )
+    ]
+
+
+def alias_map_for_photos(conn, photo_paths):
+    """{dup_path: canonical_path} for the given photos (empty when none)."""
+    paths = list(photo_paths)
+    if not paths:
+        return {}
+    marks = ",".join("?" * len(paths))
+    return {
+        r[0]: r[1]
+        for r in conn.execute(
+            f"SELECT dup_path, canonical_path FROM duplicates WHERE dup_path IN ({marks})",
+            paths,
+        )
+    }
+
+
+def canonical_for_tag(conn, image_path):
+    """Effective tag source: canonical path for aliases, else the path itself."""
+    row = conn.execute(
+        "SELECT canonical_path FROM duplicates WHERE dup_path=?", (str(image_path),)
+    ).fetchone()
+    return row[0] if row else str(image_path)
+
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
@@ -200,6 +358,46 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_photo_faces_face_id "
         "ON photo_faces(face_id)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_hashes (
+            path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            size INTEGER NOT NULL,
+            sha256 TEXT,
+            phash TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS duplicates (
+            dup_path TEXT PRIMARY KEY,
+            canonical_path TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dismissed_pairs (
+            path_a TEXT NOT NULL,
+            path_b TEXT NOT NULL,
+            PRIMARY KEY (path_a, path_b)
+        )
+        """
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_hashes_sha ON file_hashes(sha256)"
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_duplicates_canonical "
+        "ON duplicates(canonical_path)"
     )
 
     cursor.execute(
@@ -381,8 +579,15 @@ def main():
     id_counter = max(
         (g["id"] for g in groups if isinstance(g.get("id"), int)), default=0
     )
+    dup_skipped = 0
     for img_path in tqdm(new_files, desc="Grouping photos", unit="photo"):
         try:
+            canonical = check_duplicate(conn, str(img_path))
+            if canonical is not None:
+                dup_skipped += 1
+                print(f"Duplicate of {Path(canonical).name} — linked, not rescanned: "
+                      f"{img_path.name}")
+                continue
             img = read_image(str(img_path))
             if img is None:
                 print(f"Could not read image: {img_path}")
@@ -476,6 +681,7 @@ def main():
     conn.close()
 
     print(f"Done. {len(groups)} group(s) in '{output_faces_dir}', state in '{args.db_file}'.")
+    print(f"{dup_skipped} duplicate(s) linked, not rescanned.")
     print("Use the web UI export (CSV/JSON) for a portable report.")
 
 if __name__ == '__main__':

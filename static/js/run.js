@@ -5,6 +5,7 @@
 import { $, api, saveSettings, state } from "./core.js";
 import { toast, toastError } from "./toast.js";
 import { refreshPeopleList } from "./groups.js";
+import { loadDuplicates } from "./duplicates.js";
 
 let refresh = () => {};
 let lastGroupsVersion = -1;
@@ -85,5 +86,6 @@ async function pollStatus() {
         $("#cancel-btn").classList.add("hidden");
         document.body.classList.remove("is-running");
         refresh();
+        loadDuplicates();
     }
 }

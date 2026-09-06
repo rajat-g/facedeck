@@ -152,19 +152,26 @@ async function fetchTags(groupId, srcPath) {
         const data = await api(
             `/api/photo-tags?group_id=${groupId}&path=${encodeURIComponent(srcPath)}`
         );
-        return data.tags || [];
+        return { tags: data.tags || [], duplicateOf: data.duplicate_of || null };
     } catch (_) {
-        return [];
+        return { tags: [], duplicateOf: null };
     }
 }
 
 function loadFaceTags(lb, srcPath, box) {
     // Clear any overlay from the previous photo immediately.
     document.querySelector("#lightbox-imgwrap .tag-layer")?.remove();
-    fetchTags(lb.groupId, srcPath).then((tags) => {
+    fetchTags(lb.groupId, srcPath).then(({ tags, duplicateOf }) => {
         // Guard on identity AND photo: navigation mutates the same object,
         // so a slow earlier fetch must not paint over a newer photo.
         if (state.lightbox !== lb || lb.items[lb.index] !== srcPath) return;
+        if (duplicateOf) {
+            const dup = document.createElement("div");
+            dup.className = "muted small";
+            dup.textContent = `Exact duplicate of ${duplicateOf.split(/[/\\]/).pop()} — tags shared.`;
+            dup.title = duplicateOf;
+            box.appendChild(dup);
+        }
         if (tags.length === 0) {
             const note = document.createElement("div");
             note.className = "muted small";

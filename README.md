@@ -63,6 +63,12 @@ The web UI lets you:
 - Face tags on source photos: hover boxes with names (Facebook-style), click a tag to open that person
 - Remove incorrect/unwanted faces (moved to a `.trash` folder) and undo moves/deletes
 - Delete fully empty groups (no faces, no photos) from the detail panel, with undo
+- Duplicates: bit-identical photos are detected by content hash, skipped on
+  rescan, and shown in the same groups automatically; the Duplicates panel
+  lists copy sets (delete sends copies to the OS Recycle Bin) and can scan
+  for "possibly the same" lookalikes (perceptual hash) for side-by-side
+  review — link as same, or keep both. Source photos are never deleted
+  inside the app except via that panel
 - Select multiple faces (Ctrl-click / Shift-click) or drag-and-drop them between groups.
   Moving a crop also moves its source photo's group link (via face tags);
   a photo leaves its old group only when none of its faces remain there.

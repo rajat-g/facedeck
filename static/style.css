@@ -213,6 +213,7 @@ textarea#input-folders { font-family: var(--mono); font-size: 12px; resize: vert
   background: var(--bg-soft); border: 1px solid var(--line);
   padding: 3px 11px; border-radius: var(--pill);
 }
+.count-pill:empty { display: none; }
 .search {
   position: relative; display: flex; align-items: center; gap: 4px;
   flex: 1; max-width: 400px; min-width: 230px;
@@ -477,6 +478,37 @@ body.is-running .delete-group { opacity: 0.45; pointer-events: none; }
   pointer-events: none;
 }
 .face-tag-box:hover .face-tag-name { opacity: 1; transform: none; }
+
+/* Duplicates panel */
+.dupe-hint { margin: 4px 0 12px; }
+.dupe-empty { margin: 6px 0; }
+.dupe-set {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.dupe-set .dupe-head {
+  display: flex; align-items: center; gap: 11px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--line);
+}
+.dupe-avatar { width: 34px; height: 34px; font-size: 12px; }
+.dupe-set .photo-rows { border: none; border-radius: 0; margin-top: 0; }
+.dupe-set .photo-row:last-child { border-bottom: none; }
+.dup-tag {
+  display: inline-block;
+  font-size: 10px; font-weight: 800;
+  background: var(--accent-soft); color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px; padding: 0 7px; margin-left: 6px;
+  vertical-align: 1px;
+}
+.photo-cell .dup-tag { margin-left: 4px; padding: 0 5px; }
+.mini-link { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.mini-link select { width: auto; padding: 6px 8px; font-size: 12px; max-width: 180px; }
+#dupes-near { margin-top: 4px; }
 .viewer-meta { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
 .meta-bar { display: flex; align-items: center; gap: 10px; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; flex-wrap: wrap; }
 .meta-bar .meta-text { flex: 1; min-width: 0; }

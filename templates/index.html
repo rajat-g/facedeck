@@ -137,6 +137,27 @@
             <div id="filter-summary" class="muted filter-summary hidden"></div>
         </section>
 
+        <!-- Duplicates -->
+        <section class="card dupe-card" aria-label="Duplicate photos">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">Duplicates <span id="dupes-count" class="count-pill"></span></h2>
+                <div class="toolbar-filters">
+                    <button id="dupes-refresh" class="btn" title="Reload duplicate sets">↻ Refresh</button>
+                    <label class="inline-field">Match
+                        <select id="dupes-threshold" title="Lower = stricter lookalikes">
+                            <option value="6">Strict (6)</option>
+                            <option value="10" selected>Balanced (10)</option>
+                            <option value="14">Loose (14)</option>
+                        </select>
+                    </label>
+                    <button id="dupes-scan" class="btn" title="Find possibly-the-same photos (review only, nothing changes)">🔍 Find possibly-same</button>
+                </div>
+            </div>
+            <p class="muted small dupe-hint">Exact copies are linked automatically and skipped on rescan — they appear in the same groups free. Lookalikes below need your call.</p>
+            <div id="dupes-exact"></div>
+            <div id="dupes-near"></div>
+        </section>
+
         <!-- Master / detail workspace -->
         <div class="workspace">
             <aside class="card people-pane" aria-label="People list">
@@ -223,6 +244,6 @@
         </div>
     </div>
 
-    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=4"></script>
+    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=5"></script>
 </body>
 </html>

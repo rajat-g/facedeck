@@ -5,6 +5,7 @@ import { toastSuccess } from "./toast.js";
 import { initBrowse } from "./browse.js";
 import { initRun } from "./run.js";
 import { initGroups, loadGroups, selectPerson } from "./groups.js";
+import { initDuplicates, loadDuplicates } from "./duplicates.js";
 import { closeLightbox, initLightbox, lightboxIsOpen, lightboxNavigate, openFaceViewer } from "./lightbox.js";
 import { closeMoveModal, initMoveModal, moveModalIsOpen, openMoveModal } from "./movemodal.js";
 import { undoLast } from "./ops.js";
@@ -129,7 +130,9 @@ initRun(loadGroups);
 initGroups(loadGroups);
 initLightbox(loadGroups);
 initMoveModal(loadGroups);
+initDuplicates(loadGroups);
 
 loadSettings();
 updateConfigSummary();
 loadGroups();
+loadDuplicates();

@@ -13,17 +13,25 @@ import traceback
 from pathlib import Path
 
 import cv2
+import numpy as np
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from pathvalidate import ValidationError, validate_filename
+from send2trash import send2trash
 
 from face_grouping_v5 import (
+    alias_map_for_photos,
+    canonical_for_tag,
+    check_duplicate,
     cosine_similarity,
+    group_photos_with_dupes,
     image_face_id,
     load_processed_state,
     open_db,
+    photo_in_group,
     read_image,
     record_photo_face,
     reset_photo_faces,
+    resolve_canonical,
     save_processed_state,
 )
 
@@ -315,12 +323,19 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
         # can show people as they are found instead of only at the end.
         last_checkpoint = time.time()
         since_checkpoint = 0
+        dup_skipped = 0
 
         for img_path in new_files:
             if run_state.cancel_requested:
                 log("Cancelled by user. Saving progress so far...")
                 break
             try:
+                canonical = check_duplicate(conn, str(img_path))
+                if canonical is not None:
+                    dup_skipped += 1
+                    log(f"Duplicate of {Path(canonical).name} — linked, not rescanned: "
+                        f"{img_path.name}")
+                    continue
                 img = read_image(str(img_path))
                 if img is None:
                     log(f"Could not read image: {img_path}")
@@ -427,7 +442,8 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
         conn.commit()
         conn.close()
 
-        run_state.add_log("Processing completed.")
+        run_state.add_log(
+            f"Processing completed ({dup_skipped} duplicate(s) linked, not rescanned).")
     except Exception as exc:
         traceback.print_exc()
         with run_state.lock:
@@ -549,8 +565,14 @@ def api_groups():
         name = row["name"] or directory.name
         if summary:
             photo_count = conn.execute(
-                "SELECT COUNT(*) FROM group_image_paths WHERE group_id=?",
-                (row["id"],),
+                "SELECT COUNT(*) FROM ("
+                "SELECT image_path FROM group_image_paths WHERE group_id=? "
+                "UNION "
+                "SELECT d.dup_path FROM duplicates d "
+                "JOIN group_image_paths g ON g.image_path = d.canonical_path "
+                "AND g.group_id=?"
+                ")",
+                (row["id"], row["id"]),
             ).fetchone()[0]
             face_count = 0
             if directory.is_dir():
@@ -580,13 +602,7 @@ def api_groups():
                 for p in directory.iterdir()
                 if p.is_file() and p.suffix.lower() in FACE_EXTENSIONS
             )
-        image_paths = sorted(
-            r[0]
-            for r in conn.execute(
-                "SELECT image_path FROM group_image_paths WHERE group_id=?",
-                (row["id"],),
-            )
-        )
+        image_paths = group_photos_with_dupes(conn, row["id"])
         result.append(
             {
                 "id": row["id"],
@@ -678,31 +694,42 @@ def api_group_photos(group_id):
     if exists is None:
         conn.close()
         return jsonify({"error": "Group not found"}), 404
+    # Union of direct links and inherited duplicates; search applies to both.
+    base = (
+        "SELECT image_path FROM group_image_paths WHERE group_id=? "
+        "UNION "
+        "SELECT d.dup_path FROM duplicates d "
+        "JOIN group_image_paths g ON g.image_path = d.canonical_path "
+        "AND g.group_id=?"
+    )
     if q:
         like = f"%{_like_escape(q)}%"
         total = conn.execute(
-            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=? AND image_path LIKE ? ESCAPE '\\'",
-            (group_id, like),
+            f"SELECT COUNT(*) FROM ({base}) WHERE image_path LIKE ? ESCAPE '\\'",
+            (group_id, group_id, like),
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT image_path FROM group_image_paths WHERE group_id=? AND image_path LIKE ? ESCAPE '\\' "
+            f"SELECT image_path FROM ({base}) WHERE image_path LIKE ? ESCAPE '\\' "
             "ORDER BY image_path LIMIT ? OFFSET ?",
-            (group_id, like, per_page, (page - 1) * per_page),
+            (group_id, group_id, like, per_page, (page - 1) * per_page),
         ).fetchall()
     else:
         total = conn.execute(
-            "SELECT COUNT(*) FROM group_image_paths WHERE group_id=?",
-            (group_id,),
+            f"SELECT COUNT(*) FROM ({base})",
+            (group_id, group_id),
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT image_path FROM group_image_paths WHERE group_id=? "
+            f"SELECT image_path FROM ({base}) "
             "ORDER BY image_path LIMIT ? OFFSET ?",
-            (group_id, per_page, (page - 1) * per_page),
+            (group_id, group_id, per_page, (page - 1) * per_page),
         ).fetchall()
+    photos = [r[0] for r in rows]
+    aliases = alias_map_for_photos(conn, photos)
     conn.close()
     return jsonify(
         {
-            "photos": [r[0] for r in rows],
+            "photos": photos,
+            "aliases": aliases,
             "total": total,
             "page": page,
             "per_page": per_page,
@@ -1367,13 +1394,7 @@ def api_export():
                 for p in directory.iterdir()
                 if p.is_file() and p.suffix.lower() in FACE_EXTENSIONS
             )
-        sources = sorted(
-            r[0]
-            for r in conn.execute(
-                "SELECT image_path FROM group_image_paths WHERE group_id=?",
-                (row["id"],),
-            )
-        )
+        sources = group_photos_with_dupes(conn, row["id"])
         rows.append(
             {
                 "id": row["id"],
@@ -1427,10 +1448,7 @@ def api_source_image():
 
     conn = open_db(db_file)
     try:
-        allowed = conn.execute(
-            "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
-            (group_id, path),
-        ).fetchone()
+        allowed = photo_in_group(conn, group_id, path)
 
         if not allowed or not Path(path).is_file():
             return jsonify({"error": "Image not found"}), 404
@@ -1519,14 +1537,12 @@ def api_photo_tags():
         return jsonify({"error": "Database file does not exist"}), 404
 
     conn = open_db(db_file)
-    allowed = conn.execute(
-        "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
-        (group_id, path),
-    ).fetchone()
+    allowed = photo_in_group(conn, group_id, path)
     if not allowed:
         conn.close()
         return jsonify({"error": "Image not associated with this group"}), 404
 
+    tag_source = canonical_for_tag(conn, path)
     rows = conn.execute(
         "SELECT pf.face_idx, pf.face_id, pf.x1, pf.y1, pf.x2, pf.y2, "
         "COALESCE(cf.group_id, pf.group_id) AS group_id, g.name, g.directory "
@@ -1535,7 +1551,7 @@ def api_photo_tags():
         "LEFT JOIN groups g ON g.id = COALESCE(cf.group_id, pf.group_id) "
         "WHERE pf.image_path=? AND pf.detached=0 "
         "ORDER BY pf.face_idx",
-        (path,),
+        (tag_source,),
     ).fetchall()
     conn.close()
 
@@ -1554,7 +1570,299 @@ def api_photo_tags():
                 "name": name,
             }
         )
-    return jsonify({"tags": tags})
+    return jsonify({"tags": tags,
+                    "duplicate_of": tag_source if tag_source != path else None})
+
+
+# ---------- Duplicates (exact aliases + near-dupe review) ----------
+
+def _groups_for_photo(conn, image_path):
+    """[{"id", "name"}] of groups directly linking a photo."""
+    seen = {}
+    for gid, name, directory in conn.execute(
+        "SELECT g.id, g.name, g.directory FROM groups g "
+        "JOIN group_image_paths p ON p.group_id = g.id "
+        "WHERE p.image_path=?",
+        (image_path,),
+    ):
+        seen[gid] = name or Path(directory).name
+    return [{"id": gid, "name": seen[gid]} for gid in sorted(seen)]
+
+
+def _group_names_for_photo(conn, image_path):
+    return [g["name"] for g in _groups_for_photo(conn, image_path)]
+
+
+@app.route("/api/duplicates")
+def api_duplicates():
+    """Exact-duplicate sets: canonical photo + its aliases."""
+    db_file = request.args.get("db_file", "processing_state.db")
+    if not Path(db_file).exists():
+        return jsonify({"sets": []})
+    conn = open_db(db_file)
+    by_canon = {}
+    for dup_path, canon in conn.execute(
+        "SELECT dup_path, canonical_path FROM duplicates "
+        "ORDER BY canonical_path, dup_path"
+    ):
+        by_canon.setdefault(canon, []).append(dup_path)
+    sets = []
+    for canon, dups in by_canon.items():
+        canon_groups = _groups_for_photo(conn, canon)
+        sets.append(
+            {
+                "canonical": canon,
+                "canonical_exists": Path(canon).is_file(),
+                "groups": [g["name"] for g in canon_groups],
+                "group_ids": [g["id"] for g in canon_groups],
+                "duplicates": [
+                    {"path": d, "exists": Path(d).is_file()} for d in dups
+                ],
+            }
+        )
+    conn.close()
+    return jsonify({"sets": sets})
+
+
+@app.route("/api/duplicates", methods=["DELETE"])
+def api_delete_duplicates():
+    """Send duplicate copies to the OS Recycle Bin (canonicals are kept).
+
+    Only recorded aliases can be deleted here — use the persons UI for
+    anything else. No in-app undo; restore from the Recycle Bin.
+    """
+    busy = _require_idle()
+    if busy:
+        return busy
+    data = request.get_json(force=True)
+    db_file = (data.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    paths = data.get("paths") or []
+    if not paths:
+        return jsonify({"error": "No duplicates selected"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    deleted, errors = [], []
+    try:
+        for raw in paths:
+            p = str(raw)
+            row = conn.execute(
+                "SELECT canonical_path FROM duplicates WHERE dup_path=?", (p,)
+            ).fetchone()
+            if row is None:
+                errors.append(f"{p}: not a recorded duplicate (originals are kept)")
+                continue
+            try:
+                if Path(p).exists():
+                    send2trash(p)
+            except OSError as exc:
+                errors.append(f"{p}: recycle failed: {exc}")
+                continue
+            conn.execute("DELETE FROM duplicates WHERE dup_path=?", (p,))
+            conn.execute("DELETE FROM file_hashes WHERE path=?", (p,))
+            deleted.append(p)
+        conn.commit()
+        return jsonify({"ok": True, "deleted": deleted, "errors": errors})
+    finally:
+        conn.close()
+
+
+_POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+def _hamming(a, b):
+    """Hamming distance between two hex perceptual hashes."""
+    x = int(a, 16) ^ int(b, 16)
+    return int(_POPCOUNT[np.frombuffer(x.to_bytes(8, "big"), dtype=np.uint8)].sum())
+
+
+@app.route("/api/duplicates/scan", methods=["POST"])
+def api_scan_near_dupes():
+    """Find 'possibly the same' photos by perceptual-hash distance.
+
+    Pure read (plus dismissal filtering) — nothing is linked or skipped;
+    every candidate needs a human decision in the review panel.
+    """
+    data = request.get_json(force=True) if request.data else {}
+    db_file = (data.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    try:
+        threshold = int(data.get("threshold", 10))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid threshold"}), 400
+    threshold = max(1, min(threshold, 64))
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        rows = conn.execute(
+            "SELECT path, sha256, phash FROM file_hashes WHERE phash IS NOT NULL"
+        ).fetchall()
+        alias_paths = {
+            r[0] for r in conn.execute("SELECT dup_path FROM duplicates")
+        }
+        dismissed = {
+            (r[0], r[1]) for r in conn.execute("SELECT path_a, path_b FROM dismissed_pairs")
+        }
+        # Only real files with distinct content; aliases excluded (their
+        # canonical already represents them).
+        items = [
+            (r[0], r[1], r[2]) for r in rows
+            if r[0] not in alias_paths and Path(r[0]).is_file()
+        ]
+        parent = list(range(len(items)))
+        pairs = []
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        try:
+            vals = np.array([int(h, 16) & ((1 << 64) - 1) for (_p, _s, h) in items],
+                            dtype=np.uint64)
+        except ValueError:
+            vals = None
+        if vals is not None:
+            # Row-at-a-time vectorised distances: O(n) numpy work per photo,
+            # seconds for tens of thousands instead of hours of Python loops.
+            shas = [s for (_p, s, _h) in items]
+            for i in range(len(items)):
+                if len(pairs) >= 2000:
+                    break
+                x = np.bitwise_xor(vals[i], vals[i + 1:])
+                if x.size == 0:
+                    continue
+                dists = _POPCOUNT[x.view(np.uint8).reshape(-1, 8)].sum(axis=1)
+                for k in np.where(dists <= threshold)[0]:
+                    j = i + 1 + int(k)
+                    if shas[i] is not None and shas[i] == shas[j]:
+                        continue  # exact duplicates have their own flow
+                    a, b = sorted((items[i][0], items[j][0]))
+                    if (a, b) in dismissed:
+                        continue
+                    pairs.append([a, b, int(dists[int(k)])])
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+                    if len(pairs) >= 2000:
+                        break
+
+        comps = {}
+        for i, (p, _s, _h) in enumerate(items):
+            comps.setdefault(find(i), []).append(p)
+        sets = []
+        for members in comps.values():
+            if len(members) < 2:
+                continue
+            member_set = set(members)
+            sets.append(
+                {
+                    "photos": [
+                        {
+                            "path": p,
+                            "exists": True,
+                            "groups": _groups_for_photo(conn, p),
+                        }
+                        for p in sorted(members)
+                    ],
+                    "pairs": [pr for pr in pairs
+                              if pr[0] in member_set and pr[1] in member_set],
+                }
+            )
+        sets.sort(key=lambda s: -len(s["photos"]))
+        return jsonify({"sets": sets, "scanned": len(items),
+                        "threshold": threshold,
+                        "truncated": len(pairs) >= 2000})
+    finally:
+        conn.close()
+
+
+@app.route("/api/duplicates/link", methods=["POST"])
+def api_link_duplicate():
+    """Treat photo B as the same as A (alias), or undo that (`unlink: true)."""
+    busy = _require_idle()
+    if busy:
+        return busy
+    data = request.get_json(force=True)
+    db_file = (data.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    dup = (data.get("dup") or "").strip()
+    canon = (data.get("canonical") or "").strip()
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        if data.get("unlink"):
+            if not dup:
+                return jsonify({"error": "dup path is required"}), 400
+            conn.execute("DELETE FROM duplicates WHERE dup_path=?", (dup,))
+            # The dup kept its own tag rows, so its links recompute exactly.
+            relink_photo(conn, dup)
+            conn.commit()
+            return jsonify({"ok": True, "unlinked": dup})
+        if not dup or not canon:
+            return jsonify({"error": "Both dup and canonical paths are required"}), 400
+        root = resolve_canonical(conn, canon)
+        if dup == root:
+            return jsonify({"error": "A photo cannot alias itself"}), 400
+        # Re-point anything aliasing the dup so no chains form.
+        conn.execute(
+            "UPDATE duplicates SET canonical_path=? WHERE canonical_path=?",
+            (root, dup),
+        )
+        conn.execute("DELETE FROM group_image_paths WHERE image_path=?", (dup,))
+        # The dup keeps its own tag rows (needed if ever unlinked); while
+        # aliased, the canonical's rows are served instead.
+        conn.execute(
+            "INSERT OR REPLACE INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+            (dup, root),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "dup": dup, "canonical": root})
+    finally:
+        conn.close()
+
+
+@app.route("/api/duplicates/dismiss", methods=["POST"])
+def api_dismiss_pair():
+    """Dismiss (or un-dismiss) near-duplicate candidate pairs.
+
+    Accepts {"a","b"} or {"pairs": [[a,b], ...], "undismiss": bool}.
+    """
+    data = request.get_json(force=True)
+    db_file = (data.get("db_file") or "processing_state.db").strip() or "processing_state.db"
+    pairs = data.get("pairs")
+    if pairs is None:
+        pairs = [[data.get("a"), data.get("b")]]
+    clean = []
+    for pr in pairs:
+        try:
+            a, b = pr
+        except (TypeError, ValueError):
+            continue
+        a, b = (a or "").strip(), (b or "").strip()
+        if a and b and a != b:
+            clean.append(sorted((a, b)))
+    if not clean:
+        return jsonify({"error": "Two different paths are required"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        if data.get("undismiss"):
+            conn.executemany(
+                "DELETE FROM dismissed_pairs WHERE path_a=? AND path_b=?", clean
+            )
+        else:
+            conn.executemany(
+                "INSERT OR IGNORE INTO dismissed_pairs(path_a, path_b) VALUES (?, ?)",
+                clean,
+            )
+        conn.commit()
+        return jsonify({"ok": True, "dismissed": not data.get("undismiss"),
+                        "count": len(clean)})
+    finally:
+        conn.close()
 
 
 # ---------- Approve (permanent crop deletion) ----------
@@ -1669,10 +1977,7 @@ def api_reveal():
     if not Path(db_file).exists():
         return jsonify({"error": "Database file does not exist"}), 404
     conn = open_db(db_file)
-    allowed = conn.execute(
-        "SELECT 1 FROM group_image_paths WHERE group_id=? AND image_path=?",
-        (group_id, path),
-    ).fetchone()
+    allowed = photo_in_group(conn, group_id, path)
     conn.close()
     if not allowed:
         return jsonify({"error": "Image not associated with this group"}), 404

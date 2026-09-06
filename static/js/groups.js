@@ -196,7 +196,7 @@ function resetViewers() {
     // Photo list (text rows, no images) opens by default; thumbnail mode
     // stays opt-in since it loads real images per selection.
     const listByDefault = (state.photos.mode || "list") === "list";
-    state.photos = { items: [], total: 0, page: 1, mode: state.photos.mode || "list", query: "", visible: listByDefault, loading: false };
+    state.photos = { items: [], total: 0, page: 1, mode: state.photos.mode || "list", query: "", visible: listByDefault, loading: false, aliases: {} };
     state.selection.clear();
 }
 
@@ -604,6 +604,7 @@ async function loadPhotos(page) {
         if (myReq !== photosReq || state.selectedId !== g.id) return;
         if (!Array.isArray(data.photos)) throw new Error("bad photos response");
         state.photos.items = data.photos;
+        state.photos.aliases = data.aliases || {};
         state.photos.total = Number.isFinite(data.total) ? data.total : data.photos.length;
         state.photos.page = Number.isFinite(data.page) ? data.page : page;
     } catch (err) {
@@ -668,12 +669,14 @@ function renderPhotosBody() {
 
 function renderPhotoRow(g, srcPath) {
     const name = basename(srcPath);
+    const canon = (state.photos.aliases || {})[srcPath];
     const row = document.createElement("div");
     row.className = "photo-row";
-    row.title = srcPath;
+    row.title = canon ? `${srcPath}\nExact duplicate of ${canon}` : srcPath;
     row.innerHTML =
-        `<span class="photo-ico">🖼</span>` +
-        `<span class="photo-meta"><span class="photo-name">${escapeHtml(name)}</span>` +
+        `<span class="photo-ico">${canon ? "⧉" : "🖼"}</span>` +
+        `<span class="photo-meta"><span class="photo-name">${escapeHtml(name)}` +
+        `${canon ? ` <span class="dup-tag" title="Exact duplicate of ${escapeHtml(canon)}">dup</span>` : ""}</span>` +
         `<span class="photo-path">${escapeHtml(srcPath)}</span></span>` +
         `<span class="photo-actions"><button class="btn preview">Preview</button>` +
         `<button class="btn reveal">Reveal</button></span>`;
@@ -695,10 +698,12 @@ function renderPhotoCell(g, srcPath) {
     const name = basename(srcPath);
     const cell = document.createElement("div");
     cell.className = "photo-cell";
-    cell.title = srcPath;
+    const canonCell = (state.photos.aliases || {})[srcPath];
+    cell.title = canonCell ? `${srcPath}\nExact duplicate of ${canonCell}` : srcPath;
     cell.innerHTML =
         `<img src="${sourceUrl(g.id, srcPath)}" alt="${escapeHtml(name)}" loading="lazy" decoding="async" onerror="this.style.display='none'">` +
-        `<div class="photo-foot"><span>${escapeHtml(name)}</span>` +
+        `<div class="photo-foot"><span>${escapeHtml(name)}` +
+        `${canonCell ? ` <span class="dup-tag" title="Exact duplicate">⧉</span>` : ""}</span>` +
         `<button class="mini-btn reveal" title="Reveal in Explorer">🗁</button></div>`;
     cell.addEventListener("click", (e) => {
         if (e.target.closest(".reveal")) return;

@@ -18,7 +18,7 @@ export const state = {
     lastSelectedKey: null,
     // per-person viewers (opt-in, paginated)
     faces: { items: [], total: 0, page: 1, visible: false, loading: false },
-    photos: { items: [], total: 0, page: 1, mode: "list", query: "", visible: true, loading: false },
+    photos: { items: [], total: 0, page: 1, mode: "list", query: "", visible: true, loading: false, aliases: {} },
     lightbox: null, // {kind:'face'|'source', groupId, groupName, items, index}
     moveContext: null,
     pollTimer: null,
