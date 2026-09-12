@@ -23,13 +23,19 @@ from face_grouping_v5 import (
     canonical_for_tag,
     check_duplicate,
     cosine_similarity,
+    faceless_in_folders,
+    faceless_photos,
     group_photos_with_dupes,
     image_face_id,
+    is_suppressed,
+    last_scan_det,
     load_processed_state,
     open_db,
     photo_in_group,
     read_image,
     record_photo_face,
+    record_scan_det,
+    rejected_boxes,
     reset_photo_faces,
     resolve_canonical,
     save_processed_state,
@@ -40,7 +46,7 @@ app = Flask(__name__)
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "bmp", "tiff", "webp", "heic", "heif"}
 FACE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
-_face_app = None
+_face_apps = {}
 _face_app_lock = threading.Lock()
 
 
@@ -137,19 +143,29 @@ def pick_native_path(mode, initialdir=None):
     return result["path"]
 
 
-def get_face_app():
-    global _face_app
+def get_face_app(det_thresh=0.5):
+    """Cached InsightFace app per detection threshold.
+
+    The default 0.5 misses weak/small faces; targeted rescans use a lower one
+    (more faces, more false alarms). One loaded model per threshold.
+    """
+    try:
+        key = round(float(det_thresh), 3)
+    except (TypeError, ValueError):
+        key = 0.5
+    global _face_apps
     with _face_app_lock:
-        if _face_app is None:
+        if key not in _face_apps:
             from insightface.app import FaceAnalysis
 
-            run_state.add_log("Loading InsightFace model (buffalo_l)...")
-            _face_app = FaceAnalysis(
+            run_state.add_log(
+                f"Loading InsightFace model (buffalo_l, detection threshold {key})...")
+            _face_apps[key] = FaceAnalysis(
                 name="buffalo_l",
                 providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
-            _face_app.prepare(ctx_id=0, det_size=(640, 640))
-    return _face_app
+            _face_apps[key].prepare(ctx_id=0, det_size=(640, 640), det_thresh=key)
+    return _face_apps[key]
 
 
 def record_undo(conn, action, items):
@@ -262,38 +278,53 @@ def describe_run_target(db_file, input_folders):
     return info
 
 
-def run_grouping(input_folders, output_faces_dir, threshold, db_file):
+def run_grouping(input_folders, output_faces_dir, threshold, db_file,
+                 only_faceless=False, det_thresh=0.5):
     try:
         log = run_state.add_log
         conn, processed_files, groups = load_processed_state(db_file)
         out_root = Path(output_faces_dir).resolve()
         out_root.mkdir(parents=True, exist_ok=True)
 
-        face_app = get_face_app()
+        face_app = get_face_app(det_thresh)
 
         new_files = []
         total_files = 0
-        for input_folder in input_folders:
-            for path in Path(input_folder).rglob("*"):
-                if path.is_file() and path.suffix.lower().lstrip(".") in IMAGE_EXTENSIONS:
-                    total_files += 1
-                    abs_path = path.resolve()
-                    stat = abs_path.stat()
-                    key = str(abs_path)
-                    if key not in processed_files or processed_files[key] != (
-                        stat.st_mtime,
-                        stat.st_size,
-                    ):
-                        new_files.append(abs_path)
-                        processed_files[key] = (stat.st_mtime, stat.st_size)
+        if only_faceless:
+            # Targeted rescan: ONLY photos with no detected faces under the
+            # selected folders that were never scanned this sensitively.
+            # Everything else is left untouched.
+            for ap in faceless_in_folders(conn, input_folders, det_thresh):
+                total_files += 1
+                stat = ap.stat()
+                new_files.append(ap)
+                processed_files[str(ap)] = (stat.st_mtime, stat.st_size)
+            log(
+                f"Faceless rescan: {len(new_files)} photo(s) with no detected "
+                f"faces (detection threshold {det_thresh})"
+            )
+        else:
+            for input_folder in input_folders:
+                for path in Path(input_folder).rglob("*"):
+                    if path.is_file() and path.suffix.lower().lstrip(".") in IMAGE_EXTENSIONS:
+                        total_files += 1
+                        abs_path = path.resolve()
+                        stat = abs_path.stat()
+                        key = str(abs_path)
+                        if key not in processed_files or processed_files[key] != (
+                            stat.st_mtime,
+                            stat.st_size,
+                        ):
+                            new_files.append(abs_path)
+                            processed_files[key] = (stat.st_mtime, stat.st_size)
+
+            log(
+                f"Found {len(new_files)} new/changed image(s) "
+                f"({total_files} image(s) total in folder)"
+            )
 
         with run_state.lock:
             run_state.total = len(new_files)
-
-        log(
-            f"Found {len(new_files)} new/changed image(s) "
-            f"({total_files} image(s) total in folder)"
-        )
         log(f"Database: {Path(db_file).resolve()} — "
             f"resuming with {len(groups)} existing people.")
         try:
@@ -339,12 +370,29 @@ def run_grouping(input_folders, output_faces_dir, threshold, db_file):
                 img = read_image(str(img_path))
                 if img is None:
                     log(f"Could not read image: {img_path}")
+                    record_scan_det(conn, str(img_path), det_thresh)
                     continue
 
                 reset_photo_faces(conn, str(img_path))
                 faces = face_app.get(img)
+                record_scan_det(conn, str(img_path), det_thresh)
+                # Skip faces the user rejected (ungrouped/trashed): same image
+                # re-detects near-identical boxes, so this stops rescans from
+                # resurrecting them. Original indices are kept so face IDs
+                # stay stable.
+                indexed_faces = list(enumerate(faces))
+                rejected = rejected_boxes(conn, str(img_path))
+                if rejected:
+                    kept = []
+                    for face_idx, face in indexed_faces:
+                        if is_suppressed(face.bbox, img.shape, rejected):
+                            log(f"Ignoring previously rejected face {face_idx} "
+                                f"in {img_path.name}")
+                            continue
+                        kept.append((face_idx, face))
+                    indexed_faces = kept
 
-                for face_idx, face in enumerate(faces):
+                for face_idx, face in indexed_faces:
                     embedding = face.embedding
                     max_sim = -1.0
                     best_group = None
@@ -479,6 +527,13 @@ def api_run():
         threshold = float(data.get("threshold", 0.6))
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid threshold"}), 400
+    try:
+        det_thresh = round(float(data.get("det_thresh", 0.5)), 3)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid detection threshold"}), 400
+    if not 0.05 <= det_thresh <= 0.9:
+        return jsonify({"error": "Detection threshold must be between 0.05 and 0.9"}), 400
+    only_faceless = bool(data.get("only_faceless", False))
 
     if not input_folders:
         return jsonify({"error": "No input folders provided"}), 400
@@ -497,12 +552,37 @@ def api_run():
     if snap["running"]:
         return jsonify({"error": "Processing is already running"}), 409
 
+    faceless_targets = 0
+    if only_faceless:
+        if not Path(db_file).exists():
+            return jsonify(
+                {"error": "Database file does not exist — run a normal scan first"}
+            ), 400
+        check_conn = open_db(db_file)
+        try:
+            faceless_targets = len(
+                faceless_in_folders(check_conn, input_folders, det_thresh))
+            faceless_total = len(faceless_in_folders(check_conn, input_folders))
+        finally:
+            check_conn.close()
+        if not faceless_targets:
+            if faceless_total:
+                return jsonify(
+                    {"error": f"Those photos were already scanned at detection "
+                              f"{det_thresh} or lower — pick a lower threshold "
+                              f"to try again"}
+                ), 400
+            return jsonify(
+                {"error": "No photos without detected faces under these folders"}
+            ), 400
+
     target = describe_run_target(db_file, input_folders)
 
     run_state.reset()
     thread = threading.Thread(
         target=run_grouping,
-        args=(input_folders, output_faces, threshold, db_file),
+        args=(input_folders, output_faces, threshold, db_file,
+              only_faceless, det_thresh),
         daemon=True,
     )
     thread.start()
@@ -514,6 +594,9 @@ def api_run():
             "folder_mismatch": target["folder_mismatch"],
             "resolved_db": target["resolved_db"],
             "resolved_folders": target["resolved_folders"],
+            "only_faceless": only_faceless,
+            "det_thresh": det_thresh,
+            "faceless_targets": faceless_targets,
         }
     )
 
@@ -870,11 +953,32 @@ def trash_face(conn, group_id, filename):
         "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
         (group_id, src.stem),
     )
+    # Snapshot live tag rows: a later rescan wipes them via reset, and undo
+    # must be able to bring them back even then.
+    tags = [
+        {"image_path": r[0], "face_idx": r[1], "face_id": r[2],
+         "x1": r[3], "y1": r[4], "x2": r[5], "y2": r[6], "group_id": r[7]}
+        for r in conn.execute(
+            "SELECT image_path, face_idx, face_id, x1, y1, x2, y2, group_id "
+            "FROM photo_faces WHERE face_id=? AND detached=0",
+            (src.stem,),
+        )
+    ]
     # Detach any face tags so the removed face stops being labelled.
     conn.execute(
         "UPDATE photo_faces SET detached=1 WHERE face_id=?",
         (src.stem,),
     )
+    # Remember the rejected boxes so future rescans don't resurrect them.
+    for prow in conn.execute(
+        "SELECT image_path, x1, y1, x2, y2 FROM photo_faces WHERE face_id=?",
+        (src.stem,),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO rejected_faces"
+            "(image_path, face_id, x1, y1, x2, y2) VALUES (?, ?, ?, ?, ?, ?)",
+            (prow[0], src.stem, prow[1], prow[2], prow[3], prow[4]),
+        )
     # Recompute the source photo's links: it drops out of this group when
     # none of its faces remain here.
     trashed_photos = []
@@ -891,8 +995,133 @@ def trash_face(conn, group_id, filename):
         "trash_path": str(trash_path),
         "group_id": group_id,
         "face_id": src.stem,
+        "tags": tags,
         "photos": trashed_photos,
     }
+
+
+def ungroup_photo(conn, image_path):
+    """Remove a photo from all its groups and return it to No-faces.
+
+    Crops go to trash (undoable), tag rows are detached (so the photo drops
+    out of groups and reappears in the faceless list), and the boxes are
+    remembered as rejected so rescans don't resurrect them. Duplicate aliases
+    are simply unlinked; the canonical keeps its faces.
+
+    Returns {"photo", "faces", "items", "unlinked"}. Raises ValueError when
+    there is nothing to ungroup.
+    """
+    path = (image_path or "").strip()
+    if not path:
+        raise ValueError("Missing path")
+
+    canon = canonical_for_tag(conn, path)
+    if canon != path:
+        if not conn.execute(
+            "SELECT 1 FROM duplicates WHERE dup_path=?", (path,)
+        ).fetchone():
+            raise ValueError("Photo is not a recorded duplicate")
+        conn.execute("DELETE FROM duplicates WHERE dup_path=?", (path,))
+        conn.execute("DELETE FROM group_image_paths WHERE image_path=?", (path,))
+        return {
+            "photo": path,
+            "faces": 0,
+            "items": [{"alias_dup": path, "alias_canon": canon}],
+            "unlinked": canon,
+        }
+
+    rows = conn.execute(
+        "SELECT pf.face_idx, pf.face_id, COALESCE(cf.group_id, pf.group_id) AS gid "
+        "FROM photo_faces pf "
+        "LEFT JOIN group_cropped_faces cf ON cf.face_id = pf.face_id "
+        "WHERE pf.image_path=? AND pf.detached=0",
+        (path,),
+    ).fetchall()
+    if not rows:
+        raise ValueError("Photo has no grouped faces")
+
+    items = []
+    for face_idx, face_id, gid in rows:
+        filename = f"{face_id}.jpg"
+        trashed = None
+        if gid is not None:
+            grow = conn.execute(
+                "SELECT directory FROM groups WHERE id=?", (gid,)
+            ).fetchone()
+            if grow and (Path(grow[0]) / filename).exists():
+                item = trash_face(conn, gid, filename)
+                item.pop("photos", None)
+                items.append(item)
+                trashed = True
+        if not trashed:
+            # No crop on disk (approved or orphaned group): detach + reject.
+            live = [
+                {"image_path": path, "face_idx": face_idx, "face_id": face_id,
+                 "x1": r[0], "y1": r[1], "x2": r[2], "y2": r[3], "group_id": gid}
+                for r in conn.execute(
+                    "SELECT x1, y1, x2, y2 FROM photo_faces "
+                    "WHERE image_path=? AND face_idx=? AND detached=0",
+                    (path, face_idx),
+                )
+            ]
+            for t in live:
+                conn.execute(
+                    "INSERT OR IGNORE INTO rejected_faces"
+                    "(image_path, face_id, x1, y1, x2, y2) VALUES (?, ?, ?, ?, ?, ?)",
+                    (path, face_id, t["x1"], t["y1"], t["x2"], t["y2"]),
+                )
+            conn.execute(
+                "DELETE FROM group_cropped_faces WHERE face_id=?", (face_id,))
+            conn.execute(
+                "UPDATE photo_faces SET detached=1 WHERE image_path=? AND face_idx=?",
+                (path, face_idx),
+            )
+            items.append({
+                "face_path": filename,
+                "trash_path": str(Path(path).parent / ".trash" / filename),
+                "group_id": gid,
+                "face_id": face_id,
+                "tags": live,
+            })
+    relink_photo(conn, path)
+    return {"photo": path, "faces": len(rows), "items": items, "unlinked": None}
+
+
+@app.route("/api/photos/ungroup", methods=["POST"])
+def api_ungroup_photos():
+    busy = _require_idle()
+    if busy:
+        return busy
+    data = request.get_json(force=True)
+    db_file = _db_file_from_request(data)
+    paths = data.get("paths") or []
+    if data.get("path") and data.get("path") not in paths:
+        paths = [data.get("path")] + paths
+    if not paths:
+        return jsonify({"error": "No photos selected"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+
+    conn = open_db(db_file)
+    done, errors, undo_items = [], [], []
+    try:
+        for raw in paths:
+            try:
+                result = ungroup_photo(conn, str(raw))
+            except ValueError as exc:
+                errors.append(f"{raw}: {exc}")
+                continue
+            done.append({"photo": result["photo"], "faces": result["faces"],
+                         "unlinked": result["unlinked"]})
+            undo_items.extend(result["items"])
+        if not done:
+            conn.rollback()
+            return jsonify({"error": "; ".join(errors)}), 400
+        record_undo(conn, "ungroup", undo_items)
+        conn.commit()
+        return jsonify({"ok": True, "ungrouped": done, "errors": errors})
+    finally:
+        conn.close()
 
 
 @app.route("/api/groups/<int:group_id>/faces/<path:filename>", methods=["DELETE"])
@@ -1000,13 +1229,25 @@ def api_delete_group(group_id):
         conn.close()
 
 
+def _db_file_from_request(data):
+    """Database file from a JSON body or query string (never the default
+    unless the caller really meant it). Mutating endpoints accept both so a
+    missing field can't silently target the wrong database."""
+    db_file = ""
+    try:
+        db_file = (data.get("db_file") or "").strip()
+    except AttributeError:
+        pass
+    return db_file or (request.args.get("db_file") or "").strip() or "processing_state.db"
+
+
 @app.route("/api/faces/bulk-delete", methods=["POST"])
 def api_bulk_delete():
     busy = _require_idle()
     if busy:
         return busy
     data = request.get_json(force=True)
-    db_file = data.get("db_file", "processing_state.db")
+    db_file = _db_file_from_request(data)
     items = data.get("items") or []
     if not items:
         return jsonify({"error": "No faces selected"}), 400
@@ -1044,7 +1285,7 @@ def api_bulk_move():
     if busy:
         return busy
     data = request.get_json(force=True)
-    db_file = data.get("db_file", "processing_state.db")
+    db_file = _db_file_from_request(data)
     items = data.get("items") or []
     target_id = data.get("target_group_id")
     new_group_name = (data.get("new_group_name") or "").strip()
@@ -1268,6 +1509,13 @@ def api_undo():
 
 def undo_item(conn, item):
     """Reverse a single delete/move/group-delete item. Returns a short description."""
+    if "alias_dup" in item:
+        # Undo of a duplicate unlink: re-register the alias.
+        conn.execute(
+            "INSERT OR REPLACE INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+            (item["alias_dup"], item["alias_canon"]),
+        )
+        return f"re-linked {Path(item['alias_dup']).name} as duplicate"
     if "group" in item:
         # Undo of an empty-group delete: re-create the row and its tags.
         g = item["group"]
@@ -1302,13 +1550,32 @@ def undo_item(conn, item):
         if trash_path.exists():
             face_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(trash_path), str(face_path))
-        conn.execute(
-            "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) "
-            "VALUES (?, ?)",
-            (item["group_id"], item["face_id"]),
-        )
+        if item.get("group_id") is not None and conn.execute(
+            "SELECT 1 FROM groups WHERE id=?", (item["group_id"],)
+        ).fetchone():
+            conn.execute(
+                "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) "
+                "VALUES (?, ?)",
+                (item["group_id"], item["face_id"]),
+            )
         conn.execute(
             "UPDATE photo_faces SET detached=0 WHERE face_id=?",
+            (item["face_id"],),
+        )
+        # Re-insert tag rows a later rescan may have wiped (reset deletes
+        # everything, including detached rows); surviving rows are ignored.
+        for t in item.get("tags", []):
+            conn.execute(
+                "INSERT OR IGNORE INTO photo_faces(image_path, face_idx, face_id, "
+                "x1, y1, x2, y2, group_id, detached) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (t["image_path"], t["face_idx"], t["face_id"], t["x1"], t["y1"],
+                 t["x2"], t["y2"], t.get("group_id")),
+            )
+        # Restored faces are wanted back: lift any rejection recorded
+        # when they were trashed/ungrouped.
+        conn.execute(
+            "DELETE FROM rejected_faces WHERE face_id=?",
             (item["face_id"],),
         )
         for photo in photo_paths_for_face(conn, item["face_id"]):
@@ -1454,45 +1721,51 @@ def api_source_image():
             return jsonify({"error": "Image not found"}), 404
 
         # HEIC/HEIF need conversion for browser preview (Chrome/Firefox don't render HEIC)
-        if path.lower().endswith((".heic", ".heif")):
-            try:
-                img = read_image(path)
-                if img is None:
-                    return jsonify({"error": "Could not decode HEIC image"}), 500
-                ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                if not ok:
-                    return jsonify({"error": "HEIC conversion failed"}), 500
-                return send_file(
-                    io.BytesIO(buf.tobytes()),
-                    mimetype="image/jpeg",
-                    as_attachment=False,
-                    download_name=Path(path).stem + ".jpg",
-                    max_age=3600,
-                )
-            except Exception as exc:
-                traceback.print_exc()
-                return jsonify({"error": f"HEIC preview failed: {exc}"}), 500
+        return _serve_photo_file(path)
+    finally:
+        conn.close()
 
-        # Photos with an EXIF orientation flag are served transposed so the
-        # displayed pixels match detection space (face-tag boxes stay correct).
-        # Anything else takes the fast path: original bytes, zero overhead.
+
+def _serve_photo_file(path):
+    """Send an image file: HEIC/HEIF converted to JPEG, EXIF-rotated photos
+    transposed to display orientation, everything else as original bytes."""
+    if path.lower().endswith((".heic", ".heif")):
         try:
-            converted = _oriented_jpeg_bytes(path)
-        except Exception:
-            traceback.print_exc()
-            converted = None
-        if converted is not None:
+            img = read_image(path)
+            if img is None:
+                return jsonify({"error": "Could not decode HEIC image"}), 500
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                return jsonify({"error": "HEIC conversion failed"}), 500
             return send_file(
-                io.BytesIO(converted),
+                io.BytesIO(buf.tobytes()),
                 mimetype="image/jpeg",
                 as_attachment=False,
                 download_name=Path(path).stem + ".jpg",
                 max_age=3600,
             )
+        except Exception as exc:
+            traceback.print_exc()
+            return jsonify({"error": f"HEIC preview failed: {exc}"}), 500
 
-        return send_file(path, max_age=3600)
-    finally:
-        conn.close()
+    # Photos with an EXIF orientation flag are served transposed so the
+    # displayed pixels match detection space (face-tag boxes stay correct).
+    # Anything else takes the fast path: original bytes, zero overhead.
+    try:
+        converted = _oriented_jpeg_bytes(path)
+    except Exception:
+        traceback.print_exc()
+        converted = None
+    if converted is not None:
+        return send_file(
+            io.BytesIO(converted),
+            mimetype="image/jpeg",
+            as_attachment=False,
+            download_name=Path(path).stem + ".jpg",
+            max_age=3600,
+        )
+
+    return send_file(path, max_age=3600)
 
 
 def _oriented_jpeg_bytes(path):
@@ -1572,6 +1845,88 @@ def api_photo_tags():
         )
     return jsonify({"tags": tags,
                     "duplicate_of": tag_source if tag_source != path else None})
+
+
+# ---------- Faceless photos (processed, but no face detected) ----------
+
+@app.route("/api/faceless")
+def api_faceless():
+    """Processed photos with no detected faces (aliases resolve to canonical)."""
+    db_file = request.args.get("db_file", "processing_state.db")
+    if not Path(db_file).exists():
+        return jsonify({"photos": []})
+    conn = open_db(db_file)
+    try:
+        photos = []
+        for p in faceless_photos(conn):
+            photos.append({
+                "path": p,
+                "exists": Path(p).is_file(),
+                "last_det": last_scan_det(conn, p),
+                "rejected": conn.execute(
+                    "SELECT COUNT(*) FROM rejected_faces WHERE image_path=?",
+                    (p,),
+                ).fetchone()[0],
+            })
+    finally:
+        conn.close()
+    return jsonify({"photos": photos})
+
+
+@app.route("/api/rejected/clear", methods=["POST"])
+def api_rejected_clear():
+    """Lift rejections for photos ("allow again"), independent of undo.
+
+    Undo only ever reaches the latest action, so a rejection stranded by
+    later curation would otherwise be permanent. Clearing also drops the
+    photo's scan record, re-arming it for rescans at any threshold —
+    otherwise the repeat-guard would immediately refuse the rescan the user
+    just asked for.
+    """
+    busy = _require_idle()
+    if busy:
+        return busy
+    data = request.get_json(force=True)
+    db_file = _db_file_from_request(data)
+    paths = data.get("paths") or []
+    if data.get("path") and data.get("path") not in paths:
+        paths = [data.get("path")] + paths
+    if not paths:
+        return jsonify({"error": "No photos selected"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+
+    conn = open_db(db_file)
+    cleared = []
+    try:
+        for raw in paths:
+            path = str(raw)
+            faces = conn.execute(
+                "DELETE FROM rejected_faces WHERE image_path=?", (path,)
+            ).rowcount
+            conn.execute("DELETE FROM scan_det WHERE path=?", (path,))
+            cleared.append({"photo": path, "faces": faces})
+        conn.commit()
+        return jsonify({"ok": True, "cleared": cleared})
+    finally:
+        conn.close()
+
+
+@app.route("/api/faceless-image")
+def api_faceless_image():
+    """Serve a faceless photo. Constrained to the faceless list, so unlike
+    /api/source-image it needs no group — these photos belong to none."""
+    db_file = request.args.get("db_file", "processing_state.db")
+    path = (request.args.get("path") or "").strip()
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    try:
+        if path not in faceless_photos(conn) or not Path(path).is_file():
+            return jsonify({"error": "Image not found"}), 404
+        return _serve_photo_file(path)
+    finally:
+        conn.close()
 
 
 # ---------- Duplicates (exact aliases + near-dupe review) ----------
@@ -1676,6 +2031,20 @@ def _hamming(a, b):
     return int(_POPCOUNT[np.frombuffer(x.to_bytes(8, "big"), dtype=np.uint8)].sum())
 
 
+def _match_pct(dist):
+    """Match percentage for a 64-bit perceptual-hash distance.
+
+    Display aid only (100% = identical hashes). Hamming distance is a rough
+    similarity proxy, not a calibrated probability — the threshold still
+    decides what gets suggested.
+    """
+    try:
+        d = int(dist)
+    except (TypeError, ValueError):
+        return None
+    return round((64 - d) * 100 / 64, 1)
+
+
 @app.route("/api/duplicates/scan", methods=["POST"])
 def api_scan_near_dupes():
     """Find 'possibly the same' photos by perceptual-hash distance.
@@ -1741,7 +2110,8 @@ def api_scan_near_dupes():
                     a, b = sorted((items[i][0], items[j][0]))
                     if (a, b) in dismissed:
                         continue
-                    pairs.append([a, b, int(dists[int(k)])])
+                    dist = int(dists[int(k)])
+                    pairs.append([a, b, dist, _match_pct(dist)])
                     ri, rj = find(i), find(j)
                     if ri != rj:
                         parent[ri] = rj
@@ -1756,6 +2126,8 @@ def api_scan_near_dupes():
             if len(members) < 2:
                 continue
             member_set = set(members)
+            set_pairs = [pr for pr in pairs
+                         if pr[0] in member_set and pr[1] in member_set]
             sets.append(
                 {
                     "photos": [
@@ -1766,8 +2138,8 @@ def api_scan_near_dupes():
                         }
                         for p in sorted(members)
                     ],
-                    "pairs": [pr for pr in pairs
-                              if pr[0] in member_set and pr[1] in member_set],
+                    "pairs": set_pairs,
+                    "best_pct": max((pr[3] for pr in set_pairs), default=None),
                 }
             )
         sets.sort(key=lambda s: -len(s["photos"]))
@@ -1970,14 +2342,15 @@ def api_reveal():
     try:
         group_id = int(data.get("group_id"))
     except (TypeError, ValueError):
-        return jsonify({"error": "Invalid group id"}), 400
+        group_id = None  # faceless photos belong to no group
     path = (data.get("path") or "").strip()
     if not path:
         return jsonify({"error": "Missing path"}), 400
     if not Path(db_file).exists():
         return jsonify({"error": "Database file does not exist"}), 404
     conn = open_db(db_file)
-    allowed = photo_in_group(conn, group_id, path)
+    allowed = (group_id is not None and photo_in_group(conn, group_id, path)) \
+        or path in faceless_photos(conn)
     conn.close()
     if not allowed:
         return jsonify({"error": "Image not associated with this group"}), 404

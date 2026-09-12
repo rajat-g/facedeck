@@ -12,22 +12,24 @@ Works with `JPG / JPEG / PNG / BMP / TIFF / WEBP / HEIC / HEIF`, including iPhon
 
 ## Screenshots
 
-> Captured from a real run on freely-available demo photos ([randomuser.me](https://randomuser.me) portraits + [Unsplash](https://unsplash.com) group shots): 19 photos → 17 faces → 15 people. No personal photos are shown.
+> Captured from a real run on freely-available demo photos ([randomuser.me](https://randomuser.me) portraits + [Unsplash](https://unsplash.com) group shots): 19 photos → 23 faces → 23 people (low-threshold rescans rescued faces the default run missed). No personal photos are shown.
 
 | Setup & Run | People review | Photo with face tags |
 |---|---|---|
 | ![Setup and run panel](docs/screenshots/01-setup-run.png) | ![People list and person detail](docs/screenshots/02-people-detail.png) | ![Face tags on source photo](docs/screenshots/03-face-tags.png) |
-| Point at folders, pick threshold, start a run | Rename, filter, approve, move/delete faces (here: two resolutions of one person correctly grouped) | Hover a box to see the name, click to jump to that person |
+| Setup with native Browse buttons for every field; People/Review tabs up top | Rename, filter, approve, move/delete/ungroup faces (here: two resolutions of one person correctly grouped) | Hover a box to see the name, click to jump to that person |
 
-| Duplicates panel | Dark / light theme |
+| Review tab | Dark / light theme |
 |---|---|
 | ![Duplicates panel](docs/screenshots/04-duplicates.png) | ![Light theme](docs/screenshots/05-light-theme.png) |
-| Perceptual-hash lookalike sets with Link / Keep both (same photo at two sizes, found automatically) | Theme toggle is remembered in the browser |
+| Lookalike sets with match % and Link checked / Keep all separate, plus No-faces with detection picker and Rescan faceless | Theme toggle is remembered in the browser |
 
 To reproduce these shots with the same demo data (the `Sample_Data/` folder is git-ignored, so download it first or use your own photos):
 
 ```bash
 python face_grouping_v5.py --input_folder Sample_Data/photos --output_faces Sample_Data/faces --db_file Sample_Data/sample.db
+# rescue missed faces: re-process ONLY faceless photos with lower detection
+python face_grouping_v5.py --input_folder Sample_Data/photos --output_faces Sample_Data/faces --db_file Sample_Data/sample.db --only-faceless --det-thresh 0.3
 python face_grouping_web.py
 # open http://127.0.0.1:5000, set Database file to Sample_Data/sample.db, Refresh
 ```
@@ -51,6 +53,7 @@ python face_grouping_web.py
 - Cancel button saves progress so far
 
 ### Review UI (web, recommended)
+- Two tabs keep things uncluttered: **People** (browse + curate) and **Review** (duplicates + no-faces, with a count badge so open items don't get ignored); tab choice is remembered and hash-routed (`#/people`, `#/review`)
 - Fast **People list** — no images loaded up front, safe for thousands of photos
 - Search by name, filter **All / Pending / Approved**, min-photos filter, sort (Default, Name A–Z, Most/Fewest photos, Newest), pagination
 - Person detail: face count, photo count, folder path, **rename** (stored in DB)
@@ -59,6 +62,7 @@ python face_grouping_web.py
 - **Lightbox viewer** with prev/next, counter, and the source photo(s) each face came from
 - **Facebook-style face tags**: hover boxes with names on source photos, click a tag to open that person
 - **Copy all source photo paths** of a group to clipboard
+- **No faces detected** section: processed photos with zero faces, listed with Preview + Reveal and refreshed after every run — nothing silently disappears. **Rescan faceless** re-processes only these photos with a lower *detection* threshold (0.4–0.1); the rest of the library is skipped. Each photo remembers its last scan threshold, so repeating the same (or a higher) threshold is refused per photo — escalate 0.4 → 0.3 → 0.2 instead of re-running blindly
 - **Stats chips**: photos processed, faces, largest groups
 - **Dark / light theme**, remembered in `localStorage`; responsive layout
 
@@ -66,16 +70,17 @@ python face_grouping_web.py
 - Move faces: single move dialog, **bulk move** (Ctrl-click / Shift-click multi-select), or **drag-and-drop between groups**; create new group on the fly (named or auto `group_N`)
 - Moving a crop also moves its **source photo's group link** via face tags; a photo leaves its old group only when none of its faces remain there
 - **Delete** crops to a `.trash` folder (undoable); deleting unlinks the photo the same way
+- **Ungroup** a source photo (button on each photo row): removes it from all groups and sends it back to **No faces detected**. Crops go to trash (undoable), and the exact faces are remembered as rejected so future rescans don't resurrect them. Rejections are independent of undo — each faceless row shows its rejected count with an **Allow again** button that re-arms the photo for rescans at any threshold
 - **Approve / Approve all**: approved people are done; face crops are cleaned up, photos stay listed
 - **Delete empty groups only** (no faces, no photos) from the detail panel, with undo
-- **Undo** last move / delete / group-delete (50 entries kept)
+- **Undo** last move / delete / ungroup / group-delete (50 entries kept)
 - Curation **pauses during a run** (409 + visual lock) so checkpoints can't clobber edits; renames stay allowed
 - **Keyboard shortcuts**: arrows navigate faces, `Enter` opens lightbox, `M` moves, `Delete` removes, `Esc` closes dialogs
 
 ### Duplicates
 - **Exact duplicates** (SHA-256 content hash) auto-detected, **linked not rescanned**, shown in the same groups automatically
 - **Duplicates panel** lists copy sets; delete sends copies to the **OS Recycle Bin / Trash** (`send2trash`)
-- **Find possibly-same** (perceptual `dHash`) lookalike scan with Strict (6) / Balanced (10) / Loose (14) modes for side-by-side review — **link as same, or keep both / dismiss**
+- **Find possibly-same** (perceptual `dHash`) lookalike scan with Strict (6) / Balanced (10) / Loose (14) modes — results grouped into **one set per cluster** (no mirrored rows, safe for 10–20 burst photos) with a **match %** (best per set, closest per photo) — tick photos, pick the canonical, **Link checked**, or **Keep all separate**
 - Source photos are **never deleted inside the app except via that panel**
 
 ### Export & interfaces
@@ -136,12 +141,12 @@ python face_grouping_web.py
 # open http://127.0.0.1:5000
 ```
 
-1. **Setup & Run**: paste one folder per line (or `Add…` for a native folder dialog), set output faces folder + DB file, pick threshold.
+1. **Setup & Run**: paste one folder per line (or `Add…` for a native folder dialog), set output faces folder (`Browse…`) + DB file (`Browse…`), pick threshold.
 2. **Start grouping**: watch the progress bar, counts, and log. People appear while it runs. Use **Cancel** to stop safely.
-3. **People**: search / filter / sort on top, click a person on the left.
-4. **Person detail**: rename at the top, `View` face crops (paginated), expand source-photo rows only when needed, `Preview` / `Reveal` individual photos, `Open folder` for the group folder.
+3. **People tab**: search / filter / sort on top, click a person on the left.
+4. **Person detail**: rename at the top, `View` face crops (paginated), review the auto-loaded source-photo list (`Preview` / `Reveal` / `Ungroup` per photo), `Open folder` for the group folder.
 5. **Fix mistakes**: select faces (Ctrl/Shift-click) → Move / Delete via the bottom bulk bar, or drag a tile onto another person in the list. `Undo` reverts the last batch.
-6. **Duplicates**: open the Duplicates card → `Refresh`, optionally `Find possibly-same` → link or dismiss.
+6. **Review tab**: Duplicates card → `Refresh`, optionally `Find possibly-same` → link or keep; No faces detected → `Rescan faceless` at a lower detection threshold, or `Allow again` for previously rejected faces.
 7. **Approve** people you're happy with, then **Export CSV/JSON**.
 
 ### B. CLI (scripting / headless)
@@ -155,7 +160,9 @@ python face_grouping_v5.py \
   --input_folder /path/to/images \
   --output_faces output_faces \
   --threshold 0.6 \
-  --db_file processing_state.db
+  --db_file processing_state.db \
+  --only-faceless \
+  --det-thresh 0.3
 ```
 
 | Flag | Required | Default | Meaning |
@@ -164,6 +171,8 @@ python face_grouping_v5.py \
 | `--output_faces` | No | `output_faces` | Where cropped faces are saved (`group_N/*.jpg`) |
 | `--threshold` | No | `0.6` | Cosine similarity to join a group. Higher = stricter (more people). Lower = lenient (fewer, merged people). |
 | `--db_file` | No | `processing_state.db` | SQLite state file for resume + tags + names |
+| `--det-thresh` | No | `0.5` | Face *detection* confidence (0.05–0.9). Lower finds more faces but also more false alarms. Different from `--threshold`, which only affects grouping. |
+| `--only-faceless` | No | off | Rescan ONLY processed photos with no detected faces (pairs with `--det-thresh`). Everything else is skipped. |
 
 ### C. Desktop GUI (Tkinter)
 
@@ -176,6 +185,11 @@ Pick input/output/DB with Browse buttons, drag the threshold slider, `Start grou
 ---
 
 ## Threshold guide
+
+Two different thresholds — don't mix them up:
+
+- **Similarity `--threshold` (default 0.6)**: decides whether a *detected* face joins an existing person. Only affects grouping.
+- **Detection `--det-thresh` (default 0.5)**: the detector's confidence floor. Only this helps photos with **no faces at all** — lower it (e.g. 0.3) and rescan just those via the **Rescan faceless** button or `--only-faceless`. Lower values find more faces but also more false alarms (background patterns flagged as faces). Repeat runs at the same or a higher threshold are skipped per photo automatically.
 
 | Value | Behavior | When to use |
 |---|---|---|
@@ -191,9 +205,9 @@ You can re-run with a different threshold — only new/changed photos are reproc
 
 1. **Discover**: recursively list images (`jpg/jpeg/png/bmp/tiff/webp/heic/heif`), skip unchanged files via `(mtime, size)`.
 2. **Deduplicate**: SHA-256 exact-match check → alias registered in `duplicates`, file skipped (not re-encoded).
-3. **Detect + embed**: `read_image` (HEIC + EXIF-aware) → InsightFace `buffalo_l` → bbox + 512-d embedding per face.
+3. **Detect + embed**: `read_image` (HEIC + EXIF-aware) → InsightFace `buffalo_l` → bbox + 512-d embedding per face. Faces you trashed/ungrouped are skipped via the rejection memory (IoU match), so rescans don't resurrect them.
 4. **Cluster**: cosine similarity vs. running group average → join best group if `≥ threshold`, else create `group_N`. Crop saved to `output_faces/group_N/<face_id>.jpg`.
-5. **Tag**: normalized bbox + owning group written to `photo_faces` (drives hover tags + photo↔group links).
+5. **Tag**: normalized bbox + owning group written to `photo_faces` (drives hover tags + photo↔group links). Each photo also records the detection threshold it was scanned with, so repeat rescans at the same/higher threshold skip it automatically.
 6. **Checkpoint**: `processed_files` + `groups` + tags flushed to SQLite every 100 photos / 20 s and at the end.
 
 ---
@@ -207,8 +221,10 @@ facedeck/
 ├── face_grouping_gui.py   # Tkinter desktop GUI (basic runner/browser)
 ├── templates/index.html   # Web UI shell
 ├── static/style.css       # Dark/light theme
-├── static/js/             # Web UI logic
-├── tests/test_web_api.py  # API tests
+├── static/js/             # Web UI logic (people, review tabs, duplicates, faceless, viewer)
+├── docs/screenshots/      # README screenshots (from git-ignored demo data)
+├── Sample_Data/           # Demo photos + sample DB/faces (git-ignored, optional)
+├── tests/test_web_api.py  # API tests (77 cases)
 ├── Test/                  # Sample images (git-ignored)
 ├── output_faces/          # Cropped faces: group_1/*.jpg … + .trash/ (git-ignored)
 ├── processing_state.db    # SQLite state: files, groups, names, tags, dupes, undo (git-ignored)
@@ -226,8 +242,8 @@ facedeck/
 1. Run grouping on your library.
 2. Sort People by **Most photos** → rename the biggest groups first.
 3. Open each person → `View` faces → multi-select outliers → **Move** to the right person (or a new group).
-4. **Delete** non-faces / junk crops (goes to `.trash`, undoable).
-5. Check **Duplicates** → delete true copies (→ OS trash), link/dismiss lookalikes.
+4. **Delete** non-faces / junk crops (goes to `.trash`, undoable). **Ungroup** whole mis-grouped photos back to No faces detected.
+5. Check the **Review tab**: delete true copies (→ OS trash), link or keep lookalikes; `Rescan faceless` at a lower detection threshold for missed faces.
 6. **Approve** clean people; **delete** groups only once they're fully empty.
 7. **Export** CSV/JSON for backup or sharing.
 
@@ -238,6 +254,7 @@ facedeck/
 **No faces found?**
 - Check the format list and that `input_folders` point at files, not at the `output_faces` folder.
 - Very small / blurry / profile faces may need a lower threshold or better originals.
+- Open the **Review tab → No faces detected**: missed photos collect there with a **Rescan faceless** button that re-processes only them at a lower detection threshold.
 
 **Too many groups (one person split)?** Lower the threshold slightly (e.g. `0.60 → 0.55`) and re-run, then merge leftovers with bulk-move.
 
@@ -274,7 +291,7 @@ facedeck/
 python -m pytest tests/ -q
 ```
 
-Covers the web API (groups, faces/photos pagination, rename, move/delete/undo guards, duplicates, export).
+Covers the web API (groups, faces/photos pagination, rename, move/delete/undo guards, duplicates, faceless + ungroup + rejection allow-again, bulk DB routing, detection-threshold guards, export).
 
 ---
 

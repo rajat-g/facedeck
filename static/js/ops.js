@@ -20,7 +20,7 @@ export async function deleteFaces(items) {
         return await api("/api/faces/bulk-delete", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ items }),
+            body: JSON.stringify({ db_file: getDbFile(), items }),
         });
     } catch (err) { toastError(err.message); return null; }
 }
@@ -31,7 +31,7 @@ export async function moveFaces(items, targetGroupId, newGroupName = "") {
         return await api("/api/faces/bulk-move", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ items, target_group_id: targetGroupId, new_group_name: newGroupName }),
+            body: JSON.stringify({ db_file: getDbFile(), items, target_group_id: targetGroupId, new_group_name: newGroupName }),
         });
     } catch (err) { toastError(err.message); return null; }
 }

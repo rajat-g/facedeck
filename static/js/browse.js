@@ -28,6 +28,15 @@ export function initBrowse() {
         }
     });
 
+    $("#browse-output-btn").addEventListener("click", async () => {
+        const input = $("#output-faces");
+        const path = await browsePath("folder", dirname(input.value));
+        if (path) {
+            input.value = path.replace(/\//g, "\\");
+            saveSettings();
+        }
+    });
+
     $("#browse-db-btn").addEventListener("click", async () => {
         const input = $("#db-file");
         const path = await browsePath("save", dirname(input.value));

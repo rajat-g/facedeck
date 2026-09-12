@@ -21,6 +21,10 @@
                 </div>
             </div>
             <div class="topbar-right">
+                <nav class="topnav" aria-label="Pages">
+                    <button data-page="people" class="topnav-btn active">People</button>
+                    <button data-page="review" class="topnav-btn">Review <span id="nav-review-badge" class="nav-badge" hidden></span></button>
+                </nav>
                 <div id="header-stat" class="header-stat hidden">
                     <span class="dot" aria-hidden="true"></span>
                     <span id="header-stat-text">0 people</span>
@@ -52,7 +56,10 @@
                 <div class="grid-2">
                     <div class="field">
                         <label for="output-faces">Output faces folder</label>
-                        <input type="text" id="output-faces" value="output_faces">
+                        <div class="field-row">
+                            <input type="text" id="output-faces" value="output_faces">
+                            <button type="button" id="browse-output-btn" class="btn">Browse…</button>
+                        </div>
                     </div>
                     <div class="field">
                         <label for="db-file">Database file</label>
@@ -102,6 +109,8 @@
             <div id="stats-summary" class="chips"></div>
         </section>
 
+        <!-- Page: People -->
+        <div id="page-people" class="page">
         <!-- People toolbar -->
         <section class="card toolbar">
             <div class="toolbar-row">
@@ -137,27 +146,6 @@
             <div id="filter-summary" class="muted filter-summary hidden"></div>
         </section>
 
-        <!-- Duplicates -->
-        <section class="card dupe-card" aria-label="Duplicate photos">
-            <div class="toolbar-row">
-                <h2 class="toolbar-title">Duplicates <span id="dupes-count" class="count-pill"></span></h2>
-                <div class="toolbar-filters">
-                    <button id="dupes-refresh" class="btn" title="Reload duplicate sets">↻ Refresh</button>
-                    <label class="inline-field">Match
-                        <select id="dupes-threshold" title="Lower = stricter lookalikes">
-                            <option value="6">Strict (6)</option>
-                            <option value="10" selected>Balanced (10)</option>
-                            <option value="14">Loose (14)</option>
-                        </select>
-                    </label>
-                    <button id="dupes-scan" class="btn" title="Find possibly-the-same photos (review only, nothing changes)">🔍 Find possibly-same</button>
-                </div>
-            </div>
-            <p class="muted small dupe-hint">Exact copies are linked automatically and skipped on rescan — they appear in the same groups free. Lookalikes below need your call.</p>
-            <div id="dupes-exact"></div>
-            <div id="dupes-near"></div>
-        </section>
-
         <!-- Master / detail workspace -->
         <div class="workspace">
             <aside class="card people-pane" aria-label="People list">
@@ -186,6 +174,53 @@
                 </div>
             </section>
         </div>
+        </div>
+
+        <!-- Page: Review (duplicates + no faces) -->
+        <div id="page-review" class="page hidden">
+        <!-- Duplicates -->
+        <section class="card dupe-card" aria-label="Duplicate photos">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">Duplicates <span id="dupes-count" class="count-pill"></span></h2>
+                <div class="toolbar-filters">
+                    <button id="dupes-refresh" class="btn" title="Reload duplicate sets">↻ Refresh</button>
+                    <label class="inline-field">Match
+                        <select id="dupes-threshold" title="Lower = stricter lookalikes">
+                            <option value="6">Strict (6)</option>
+                            <option value="10" selected>Balanced (10)</option>
+                            <option value="14">Loose (14)</option>
+                        </select>
+                    </label>
+                    <button id="dupes-scan" class="btn" title="Find possibly-the-same photos (review only, nothing changes)">🔍 Find possibly-same</button>
+                </div>
+            </div>
+            <p class="muted small dupe-hint">Exact copies are linked automatically and skipped on rescan — they appear in the same groups free. Lookalikes below need your call.</p>
+            <div id="dupes-exact"></div>
+            <div id="dupes-near"></div>
+        </section>
+
+        <!-- No faces detected -->
+        <section class="card" aria-label="Photos with no detected faces">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">No faces detected <span id="faceless-count" class="count-pill"></span></h2>
+                <div class="toolbar-filters">
+                    <label class="inline-field">Detection
+                        <select id="faceless-det" title="Lower finds more faces, but also more false alarms">
+                            <option value="0.4">0.4</option>
+                            <option value="0.3" selected>0.3</option>
+                            <option value="0.2">0.2</option>
+                            <option value="0.1">0.1</option>
+                        </select>
+                    </label>
+                    <button id="faceless-rescan" class="btn primary" title="Re-process only the photos below with a lower detection threshold">Rescan faceless</button>
+                    <button id="faceless-refresh" class="btn" title="Reload the list">↻ Refresh</button>
+                </div>
+            </div>
+            <p class="muted small dupe-hint">Processed photos where no face was found — grouped nowhere, lost nowhere. Lower the detection threshold and rescan just these; the rest of the library is skipped.</p>
+            <div id="faceless-list"></div>
+        </section>
+        </div>
+
     </main>
 
     <!-- Bulk selection bar -->

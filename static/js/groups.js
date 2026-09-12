@@ -15,6 +15,7 @@ import {
     getDbFile,
     initials,
     saveSettings,
+    shortDir,
     sourceUrl,
     state,
 } from "./core.js";
@@ -30,6 +31,7 @@ import {
     revealInExplorer,
 } from "./ops.js";
 import { openFaceViewer, openSourceViewer } from "./lightbox.js";
+import { loadFaceless } from "./faceless.js";
 
 let externalRefresh = null;
 let facesReq = 0;
@@ -346,7 +348,7 @@ function renderDetail() {
                 <div class="badges">
                     ${badgesHtml(g)}
                 </div>
-                <div class="folder-path" title="${escapeHtml(g.directory)}">${escapeHtml(g.directory)}</div>
+                <div class="folder-path" title="${escapeHtml(g.directory)}">${escapeHtml(shortDir(g.directory, 60))}</div>
             </div>
         </div>
         <div class="detail-actions">
@@ -671,21 +673,38 @@ function renderPhotoRow(g, srcPath) {
     const name = basename(srcPath);
     const canon = (state.photos.aliases || {})[srcPath];
     const row = document.createElement("div");
-    row.className = "photo-row";
+    row.className = "photo-row lines";
     row.title = canon ? `${srcPath}\nExact duplicate of ${canon}` : srcPath;
     row.innerHTML =
-        `<span class="photo-ico">${canon ? "⧉" : "🖼"}</span>` +
         `<span class="photo-meta"><span class="photo-name">${escapeHtml(name)}` +
         `${canon ? ` <span class="dup-tag" title="Exact duplicate of ${escapeHtml(canon)}">dup</span>` : ""}</span>` +
-        `<span class="photo-path">${escapeHtml(srcPath)}</span></span>` +
+        `<span class="photo-sub muted small">${escapeHtml(shortDir(srcPath))}</span></span>` +
         `<span class="photo-actions"><button class="btn preview">Preview</button>` +
-        `<button class="btn reveal">Reveal</button></span>`;
+        `<button class="btn reveal">Reveal</button>` +
+        `<button class="btn ungroup" title="Remove this photo from its groups and send it back to No faces detected">Ungroup</button></span>`;
     const preview = () => openSourceViewer(g, state.photos.items, state.photos.items.indexOf(srcPath), state.photos.total);
     row.addEventListener("click", (e) => {
         if (e.target.closest("button")) return;
         preview();
     });
     row.querySelector(".preview").addEventListener("click", preview);
+    row.querySelector(".ungroup").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Remove “${name}” from its groups and send it back to No faces detected?\n\nIts faces go to trash (undoable) and won't be suggested again on rescans.`)) return;
+        try {
+            await api("/api/photos/ungroup", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ db_file: getDbFile(), paths: [srcPath] }),
+            });
+        } catch (err) {
+            toastError(err.message);
+            return;
+        }
+        toastSuccess(`“${name}” moved back to No faces detected.`);
+        loadGroups();
+        loadFaceless();
+    });
     row.querySelector(".reveal").addEventListener("click", async (e) => {
         e.stopPropagation();
         const res = await revealInExplorer(g.id, srcPath);

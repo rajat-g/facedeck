@@ -227,6 +227,124 @@ def alias_map_for_photos(conn, photo_paths):
     }
 
 
+def faceless_photos(conn):
+    """Processed files with no live detected faces, sorted.
+
+    Aliases resolve to their canonical photo (a skipped duplicate is only
+    faceless when its canonical has no faces either). Unreadable files also
+    land here — they leave no face tags behind. Only non-detached rows count:
+    photos whose faces were all trashed/ungrouped return here.
+    """
+    out = []
+    for (path,) in conn.execute("SELECT file_path FROM processed_files ORDER BY file_path"):
+        tag_source = canonical_for_tag(conn, path)
+        has = conn.execute(
+            "SELECT 1 FROM photo_faces WHERE image_path=? AND detached=0 LIMIT 1",
+            (tag_source,),
+        ).fetchone()
+        if not has:
+            out.append(str(path))
+    return out
+
+
+def faceless_in_folders(conn, input_folders, det_thresh=None):
+    """Faceless photos located under the given input folders.
+
+    Returns [abs Path, ...] (resolved, existing files only) — the exact set a
+    targeted rescan should force-process. Keys match discovery convention
+    (str of resolved path).
+
+    When det_thresh is given, photos already scanned at that threshold or
+    lower are EXCLUDED — re-running them could not find anything new.
+    Unknown (legacy, never recorded) photos are always included.
+    """
+    roots = []
+    for p in input_folders:
+        try:
+            roots.append(Path(p).resolve())
+        except OSError:
+            continue
+    try:
+        wanted = None if det_thresh is None else float(det_thresh)
+    except (TypeError, ValueError):
+        wanted = None
+    out = []
+    for stored in faceless_photos(conn):
+        try:
+            ap = Path(stored).resolve()
+        except OSError:
+            continue
+        if not ap.is_file():
+            continue
+        if not any(ap == r or r in ap.parents for r in roots):
+            continue
+        if wanted is not None:
+            last = last_scan_det(conn, str(ap))
+            if last is not None and last <= wanted:
+                continue
+        out.append(ap)
+    return out
+
+
+def record_scan_det(conn, image_path, det_thresh):
+    """Remember which detection threshold a photo was scanned with."""
+    try:
+        det = float(det_thresh)
+    except (TypeError, ValueError):
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, ?)",
+        (str(image_path), det),
+    )
+
+
+def last_scan_det(conn, image_path):
+    """Detection threshold a photo was last scanned with (None if unknown)."""
+    row = conn.execute(
+        "SELECT det_thresh FROM scan_det WHERE path=?", (str(image_path),)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def rejected_boxes(conn, image_path):
+    """Normalized (0-1) bboxes the user rejected for a photo (ungrouped)."""
+    return [
+        (r[0], r[1], r[2], r[3])
+        for r in conn.execute(
+            "SELECT x1, y1, x2, y2 FROM rejected_faces WHERE image_path=?",
+            (str(image_path),),
+        )
+    ]
+
+
+def _iou(a, b):
+    """Intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def is_suppressed(bbox, img_shape, rejected, iou_thresh=0.5):
+    """True when a detection overlaps a user-rejected box.
+
+    `bbox` is in pixels, `rejected` holds normalized boxes. The detector is
+    near-deterministic per image, so re-detections of rejected faces land at
+    IoU ~0.9+; 0.5 keeps a wide safety margin without touching neighbours.
+    """
+    h, w = img_shape[:2]
+    if h <= 0 or w <= 0:
+        return False
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    box = (x1 / w, y1 / h, x2 / w, y2 / h)
+    return any(_iou(box, r) > iou_thresh for r in rejected)
+
+
 def canonical_for_tag(conn, image_path):
     """Effective tag source: canonical path for aliases, else the path itself."""
     row = conn.execute(
@@ -392,6 +510,34 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     )
 
     cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_det (
+            path TEXT PRIMARY KEY,
+            det_thresh REAL NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rejected_faces (
+            image_path TEXT NOT NULL,
+            face_id TEXT NOT NULL,
+            x1 REAL NOT NULL,
+            y1 REAL NOT NULL,
+            x2 REAL NOT NULL,
+            y2 REAL NOT NULL,
+            UNIQUE (image_path, face_id)
+        )
+        """
+    )
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rejected_faces_image_path "
+        "ON rejected_faces(image_path)"
+    )
+
+    cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_hashes_sha ON file_hashes(sha256)"
     )
 
@@ -549,7 +695,22 @@ def main():
         default="processing_state.db",
         help="SQLite database file to track processed images",
     )
+    parser.add_argument(
+        "--det-thresh",
+        type=float,
+        default=0.5,
+        help="Face detection confidence (0.05-0.9, default 0.5). Lower finds "
+        "more faces but also more false alarms.",
+    )
+    parser.add_argument(
+        "--only-faceless",
+        action="store_true",
+        help="Rescan ONLY processed photos with no detected faces under the "
+        "input folder (pairs with --det-thresh). Everything else is skipped.",
+    )
     args = parser.parse_args()
+    if not 0.05 <= args.det_thresh <= 0.9:
+        parser.error("--det-thresh must be between 0.05 and 0.9")
 
     # Load existing state from SQLite
     conn, processed_files, groups = load_processed_state(args.db_file)
@@ -558,22 +719,30 @@ def main():
 
     # Initialize FaceAnalysis model
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    app.prepare(ctx_id=0, det_size=(640, 640))
+    app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=args.det_thresh)
 
     # Find new/changed files using absolute paths
     image_extensions = {'jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp', 'heic', 'heif'}
     new_files = []
-    for path in Path(args.input_folder).rglob('*'):
-        if path.is_file() and path.suffix.lower().lstrip('.') in image_extensions:
-            abs_path = path.resolve()
+    if args.only_faceless:
+        for abs_path in faceless_in_folders(conn, [args.input_folder]):
             file_stat = abs_path.stat()
-            file_key = str(abs_path)
-            current_mtime = file_stat.st_mtime
-            current_size = file_stat.st_size
-            
-            if file_key not in processed_files or processed_files[file_key] != (current_mtime, current_size):
-                new_files.append(abs_path)
-                processed_files[file_key] = (current_mtime, current_size)
+            new_files.append(abs_path)
+            processed_files[str(abs_path)] = (file_stat.st_mtime, file_stat.st_size)
+        print(f"Faceless rescan: {len(new_files)} photo(s) with no detected "
+              f"faces (detection threshold {args.det_thresh})")
+    else:
+        for path in Path(args.input_folder).rglob('*'):
+            if path.is_file() and path.suffix.lower().lstrip('.') in image_extensions:
+                abs_path = path.resolve()
+                file_stat = abs_path.stat()
+                file_key = str(abs_path)
+                current_mtime = file_stat.st_mtime
+                current_size = file_stat.st_size
+                
+                if file_key not in processed_files or processed_files[file_key] != (current_mtime, current_size):
+                    new_files.append(abs_path)
+                    processed_files[file_key] = (current_mtime, current_size)
 
     # Process new/changed files
     id_counter = max(
@@ -591,12 +760,23 @@ def main():
             img = read_image(str(img_path))
             if img is None:
                 print(f"Could not read image: {img_path}")
+                record_scan_det(conn, str(img_path), args.det_thresh)
                 continue
 
             reset_photo_faces(conn, str(img_path))
             faces = app.get(img)
+            record_scan_det(conn, str(img_path), args.det_thresh)
+            # Skip faces the user rejected (ungrouped/trashed); original
+            # indices are kept so face IDs stay stable.
+            indexed_faces = list(enumerate(faces))
+            rejected = rejected_boxes(conn, str(img_path))
+            if rejected:
+                indexed_faces = [
+                    (face_idx, face) for face_idx, face in indexed_faces
+                    if not is_suppressed(face.bbox, img.shape, rejected)
+                ]
 
-            for face_idx, face in enumerate(faces):
+            for face_idx, face in indexed_faces:
                 embedding = face.embedding
                 max_sim = -1
                 best_group = None
@@ -678,10 +858,15 @@ def main():
 
     # Save updated state
     save_processed_state(conn, processed_files, groups)
+    faceless = faceless_photos(conn)
     conn.close()
 
     print(f"Done. {len(groups)} group(s) in '{output_faces_dir}', state in '{args.db_file}'.")
     print(f"{dup_skipped} duplicate(s) linked, not rescanned.")
+    if faceless:
+        shown = ", ".join(Path(p).name for p in faceless[:20])
+        extra = f" … and {len(faceless) - 20} more" if len(faceless) > 20 else ""
+        print(f"{len(faceless)} photo(s) with no detected faces (see web UI): {shown}{extra}")
     print("Use the web UI export (CSV/JSON) for a portable report.")
 
 if __name__ == '__main__':

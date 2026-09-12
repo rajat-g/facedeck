@@ -6,6 +6,7 @@ import { $, api, saveSettings, state } from "./core.js";
 import { toast, toastError } from "./toast.js";
 import { refreshPeopleList } from "./groups.js";
 import { loadDuplicates } from "./duplicates.js";
+import { loadFaceless } from "./faceless.js";
 
 let refresh = () => {};
 let lastGroupsVersion = -1;
@@ -20,33 +21,60 @@ async function startRun() {
     const folders = $("#input-folders").value.split("\n").map((l) => l.trim()).filter(Boolean);
     if (folders.length === 0) { toastError("Add at least one input folder."); return; }
 
+    await startRunWith({
+        input_folders: folders,
+        output_faces: $("#output-faces").value.trim(),
+        db_file: $("#db-file").value.trim(),
+        threshold: parseFloat($("#threshold").value),
+    });
+}
+
+export async function startFacelessRescan(detThresh) {
+    const folders = $("#input-folders").value.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (folders.length === 0) { toastError("Add at least one input folder."); return; }
+
+    await startRunWith({
+        input_folders: folders,
+        output_faces: $("#output-faces").value.trim(),
+        db_file: $("#db-file").value.trim(),
+        threshold: parseFloat($("#threshold").value),
+        only_faceless: true,
+        det_thresh: detThresh,
+    }, { faceless: true });
+}
+
+async function startRunWith(payload, { faceless = false } = {}) {
     let started;
     try {
         started = await api("/api/run", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                input_folders: folders,
-                output_faces: $("#output-faces").value.trim(),
-                db_file: $("#db-file").value.trim(),
-                threshold: parseFloat($("#threshold").value),
-            }),
+            body: JSON.stringify(payload),
         });
     } catch (err) { toastError(err.message); return; }
 
-    const dbShort = (started.resolved_db || $("#db-file").value.trim()).length > 42
-        ? "…" + (started.resolved_db || $("#db-file").value.trim()).slice(-41)
-        : (started.resolved_db || $("#db-file").value.trim());
-    let msg = `Run started — ${started.existing_people ?? 0} existing people in ${dbShort}.`;
+    const folders = payload.input_folders;
+    const dbShort = (started.resolved_db || payload.db_file).length > 42
+        ? "…" + (started.resolved_db || payload.db_file).slice(-41)
+        : (started.resolved_db || payload.db_file);
+    let msg;
+    if (faceless) {
+        msg = `Faceless rescan started — ${started.faceless_targets ?? "?"} photo(s), detection ${started.det_thresh ?? payload.det_thresh}.`;
+    } else {
+        msg = `Run started — ${started.existing_people ?? 0} existing people in ${dbShort}.`;
+    }
     if (started.fresh_db) msg += " NEW database file: no previous results here.";
     if (started.folder_mismatch) msg += " Folders differ from this database's last run.";
     toast(msg, "info", 6500);
 
     saveSettings();
     $("#run-btn").disabled = true;
+    $("#faceless-rescan").disabled = true;
     $("#cancel-btn").classList.remove("hidden");
     $("#status-panel").classList.remove("hidden");
-    $("#status-meta").textContent = `${folders.length} folder(s)`;
+    $("#status-meta").textContent = faceless
+        ? `faceless rescan · ${folders.length} folder(s)`
+        : `${folders.length} folder(s)`;
     document.body.classList.add("is-running");
     lastGroupsVersion = -1;
     state.pollTimer = setInterval(pollStatus, 1000);
@@ -83,9 +111,11 @@ async function pollStatus() {
         clearInterval(state.pollTimer);
         state.pollTimer = null;
         $("#run-btn").disabled = false;
+        $("#faceless-rescan").disabled = false;
         $("#cancel-btn").classList.add("hidden");
         document.body.classList.remove("is-running");
         refresh();
         loadDuplicates();
+        loadFaceless();
     }
 }

@@ -1,7 +1,7 @@
 /* Duplicates panel: exact sets (delete copies) + near-dupe review
    (preview / link-as-same / dismiss). Nothing here auto-changes data. */
 
-import { $, api, basename, escapeHtml, getDbFile } from "./core.js";
+import { $, api, basename, escapeHtml, getDbFile, shortDir } from "./core.js";
 import { toastError, toastSuccess } from "./toast.js";
 import { openSourceViewer } from "./lightbox.js";
 import { revealInExplorer } from "./ops.js";
@@ -20,6 +20,11 @@ function renderDupesCount() {
         parts.push(`${nearSets} lookalike set${nearSets === 1 ? "" : "s"}`);
     }
     $("#dupes-count").textContent = parts.length ? `— ${parts.join(" · ")}` : "";
+    document.dispatchEvent(new CustomEvent("counts-changed"));
+}
+
+export function getDupeSetCount() {
+    return (exactSets || 0) + (nearSets || 0);
 }
 
 export function initDuplicates(loadGroups) {
@@ -98,12 +103,12 @@ function previewGroup(photo) {
 
 function exactRow(s, d) {
     const row = document.createElement("div");
-    row.className = "photo-row";
+    row.className = "photo-row lines";
     row.title = d.path;
     row.innerHTML =
         `<span class="photo-ico">⧉</span>` +
         `<span class="photo-meta"><span class="photo-name">${escapeHtml(basename(d.path))}</span>` +
-        `<span class="photo-path">${escapeHtml(d.path)}${d.exists ? "" : " (file missing)"}</span></span>` +
+        `<span class="photo-sub muted small">${escapeHtml(shortDir(d.path))}${d.exists ? "" : " · file missing"}</span></span>` +
         `<span class="photo-actions"><button class="btn preview">Preview</button>` +
         `<button class="btn reveal">Reveal</button>` +
         `<button class="btn danger delete-one">Delete</button></span>`;
@@ -187,40 +192,185 @@ function renderNear(sets, scanned, threshold) {
     for (const s of sets) box.appendChild(renderNearSet(s));
 }
 
+function pairPct(pr) {
+    // Pairs are [a, b, dist, match_pct]; recompute when pct is missing.
+    if (pr.length > 3 && Number.isFinite(Number(pr[3]))) return Number(pr[3]);
+    const d = Number(pr[2]);
+    if (!Number.isFinite(d)) return null;
+    return Math.round(((64 - d) * 100) / 64 * 10) / 10;
+}
+
+function bestPairPct(s) {
+    let best = null;
+    for (const pr of s.pairs || []) {
+        const pct = pairPct(pr);
+        if (pct != null && (best == null || pct > best)) best = pct;
+    }
+    return best;
+}
+
+function closestPct(s, path) {
+    let best = null;
+    let other = null;
+    for (const pr of s.pairs || []) {
+        if (pr[0] !== path && pr[1] !== path) continue;
+        const pct = pairPct(pr);
+        if (pct != null && (best == null || pct > best)) {
+            best = pct;
+            other = pr[0] === path ? pr[1] : pr[0];
+        }
+    }
+    return { pct: best, other };
+}
+
 function renderNearSet(s) {
     const div = document.createElement("div");
     div.className = "dupe-set near";
+    const best = s.best_pct != null ? Number(s.best_pct) : bestPairPct(s);
     const head = document.createElement("div");
     head.className = "dupe-head";
     head.innerHTML =
-        `<span class="avatar dupe-avatar">?</span>` +
         `<span class="person-meta"><span class="person-name">Possibly the same</span>` +
         `<span class="person-sub">${s.photos.length} photos` +
-        `${s.pairs.length ? ` · smallest distance ${Math.min(...s.pairs.map((p) => p[2]))}` : ""}</span></span>`;
+        (best != null ? ` · best match ${best}%` : "") + `</span></span>` +
+        (best != null
+            ? `<span class="match-pill" title="Closest perceptual-hash match in this set">~${best}%</span>`
+            : "");
     div.appendChild(head);
+
+    // One row per photo (no mirrored pairs): tick the ones to link, pick the
+    // canonical once below. Scales to burst sets — N compact rows + 2 buttons.
+    const state = {
+        canonical: s.photos[0].path,
+        checked: new Set(s.photos.slice(1).map((p) => p.path)),
+    };
+    const checks = new Map();
     const rows = document.createElement("div");
     rows.className = "photo-rows";
-    for (const p of s.photos) rows.appendChild(nearRow(s, p));
+    for (const p of s.photos) rows.appendChild(nearRow(s, p, state, checks));
     div.appendChild(rows);
+
+    const syncChecks = () => {
+        for (const [path, box] of checks) {
+            box.checked = state.checked.has(path);
+            box.disabled = path === state.canonical;
+            box.title = path === state.canonical
+                ? "Canonical — the photo the checked ones will follow"
+                : "Link this photo as the same";
+        }
+    };
+
+    const foot = document.createElement("div");
+    foot.className = "dupe-foot";
+    const canonSel = document.createElement("select");
+    canonSel.className = "canon-select";
+    canonSel.title = "The photo the checked ones will follow";
+    for (const p of s.photos) {
+        const o = document.createElement("option");
+        o.value = p.path;
+        o.textContent = basename(p.path);
+        canonSel.appendChild(o);
+    }
+    const linkBtn = document.createElement("button");
+    linkBtn.className = "btn primary link-all";
+    linkBtn.textContent = "Link checked";
+    const keepBtn = document.createElement("button");
+    keepBtn.className = "btn ghost keep-all";
+    keepBtn.textContent = "Keep all separate";
+    foot.append(
+        Object.assign(document.createElement("span"), {
+            className: "muted small", textContent: "Same as",
+        }),
+        canonSel, linkBtn, keepBtn,
+    );
+    div.appendChild(foot);
+
+    canonSel.addEventListener("change", () => {
+        state.canonical = canonSel.value;
+        state.checked.delete(state.canonical);
+        syncChecks();
+    });
+    rows.addEventListener("change", (e) => {
+        const box = e.target.closest(".link-check");
+        if (!box) return;
+        if (box.checked) state.checked.add(box.dataset.path);
+        else state.checked.delete(box.dataset.path);
+    });
+    linkBtn.addEventListener("click", async () => {
+        const targets = s.photos
+            .map((p) => p.path)
+            .filter((p) => p !== state.canonical && state.checked.has(p));
+        if (!targets.length) {
+            toastError("Nothing checked — tick the photos to link.");
+            return;
+        }
+        if (!confirm(
+            `Treat ${targets.length} photo${targets.length === 1 ? "" : "s"} as the same as “${basename(state.canonical)}”?\n\n` +
+            `They will appear in the same groups; their own links are dropped.`
+        )) return;
+        let ok = 0;
+        const errs = [];
+        for (const t of targets) {
+            try {
+                await api("/api/duplicates/link", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        db_file: getDbFile(),
+                        dup: t, canonical: state.canonical,
+                    }),
+                });
+                ok++;
+            } catch (err) {
+                errs.push(`${basename(t)}: ${err.message}`);
+            }
+        }
+        if (ok) toastSuccess(`Linked ${ok} photo${ok === 1 ? "" : "s"} — now following “${basename(state.canonical)}”.`);
+        if (errs.length) toastError(errs.join("; "));
+        loadDuplicates();
+        refresh();
+        scanNear();
+    });
+    keepBtn.addEventListener("click", async () => {
+        const pairs = (s.pairs || []).map((pr) => [pr[0], pr[1]]);
+        if (!pairs.length) return;
+        try {
+            await api("/api/duplicates/dismiss", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ db_file: getDbFile(), pairs }),
+            });
+        } catch (err) {
+            toastError(err.message);
+            return;
+        }
+        toastSuccess("Kept separate — this set won't be suggested again.");
+        scanNear();
+    });
+    syncChecks();
     return div;
 }
 
-function nearRow(s, p) {
-    const others = s.photos.filter((x) => x.path !== p.path);
+function nearRow(s, p, state, checks) {
+    const { pct, other } = closestPct(s, p.path);
+    const isCanon = p.path === state.canonical;
+    const sub = [shortDir(p.path), groupNames(p)]
+        .filter(Boolean)
+        .join(" · ") + (pct != null
+            ? ` · closest ${pct}%${other ? ` vs ${basename(other)}` : ""}`
+            : "");
     const row = document.createElement("div");
-    row.className = "photo-row";
+    row.className = "photo-row lines";
     row.title = p.path;
     row.innerHTML =
-        `<span class="photo-ico">?</span>` +
+        `<input type="checkbox" class="link-check" data-path="${escapeHtml(p.path)}">` +
         `<span class="photo-meta"><span class="photo-name">${escapeHtml(basename(p.path))}</span>` +
-        `<span class="photo-path">${escapeHtml(p.path)}</span>` +
-        `<span class="photo-sub muted small">${escapeHtml(groupNames(p))}</span></span>` +
-        `<span class="photo-actions"><button class="btn preview">Preview</button>` +
-        `<label class="mini-link">Same as <select class="link-target">` +
-        others.map((o) => `<option value="${escapeHtml(o.path)}">${escapeHtml(basename(o.path))}</option>`).join("") +
-        `</select></label>` +
-        `<button class="btn primary link">Link</button>` +
-        `<button class="btn ghost dismiss">Keep both</button></span>`;
+        `<span class="photo-sub muted small">${escapeHtml(sub)}</span></span>` +
+        `<span class="photo-actions"><button class="btn preview">Preview</button></span>`;
+    const box = row.querySelector(".link-check");
+    box.checked = !isCanon;
+    box.disabled = isCanon;
+    checks.set(p.path, box);
     const previewBtn = row.querySelector(".preview");
     previewBtn.disabled = firstGroupId(p) == null;
     previewBtn.title = firstGroupId(p) == null ? "No group to preview from" : "Preview";
@@ -228,44 +378,6 @@ function nearRow(s, p) {
         const g = previewGroup(p);
         if (!g) return;
         openSourceViewer(g, [p.path], 0, 1);
-    });
-    row.querySelector(".link").addEventListener("click", async () => {
-        const target = row.querySelector(".link-target").value;
-        if (!target) return;
-        if (!confirm(`Treat as the same photo?\n\n${p.path}\n→ alias of\n${target}\n\nIt will appear in the same groups; its own links are dropped.`)) return;
-        try {
-            await api("/api/duplicates/link", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    db_file: getDbFile(),
-                    dup: p.path, canonical: target,
-                }),
-            });
-        } catch (err) {
-            toastError(err.message);
-            return;
-        }
-        toastSuccess("Linked — photo now follows its canonical.");
-        loadDuplicates();
-        refresh();
-        scanNear();
-    });
-    row.querySelector(".dismiss").addEventListener("click", async () => {
-        const pairs = others.map((o) => [p.path, o.path]);
-        try {
-            await api("/api/duplicates/dismiss", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    db_file: getDbFile(), pairs,
-                }),
-            });
-        } catch (err) {
-            toastError(err.message);
-            return;
-        }
-        scanNear();
     });
     return row;
 }

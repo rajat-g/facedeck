@@ -68,12 +68,25 @@ export function basename(path) {
     return String(path).split(/[/\\]/).pop();
 }
 
+export function shortDir(path, keep = 42) {
+    // Folders, not full paths: the filename is already shown above.
+    if (!path) return "";
+    const idx = Math.max(String(path).lastIndexOf("/"), String(path).lastIndexOf("\\"));
+    const dir = idx >= 0 ? String(path).slice(0, idx) : "";
+    if (dir.length <= keep) return dir;
+    return "…" + dir.slice(dir.length - keep);
+}
+
 export function faceUrl(groupId, filename) {
     return `/api/groups/${groupId}/faces/${encodeURIComponent(filename)}?db_file=${encodeURIComponent(getDbFile())}`;
 }
 
 export function sourceUrl(groupId, path) {
     return `/api/source-image?group_id=${groupId}&path=${encodeURIComponent(path)}&db_file=${encodeURIComponent(getDbFile())}`;
+}
+
+export function facelessUrl(path) {
+    return `/api/faceless-image?path=${encodeURIComponent(path)}&db_file=${encodeURIComponent(getDbFile())}`;
 }
 
 export function initials(name) {

@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -644,7 +645,23 @@ class RunGuardTestCase(unittest.TestCase):
             self.client.post("/api/undo", json=db).status_code, 409
         )
         self.assertEqual(
-            self.client.delete(f"/api/groups/1?{self.q}").status_code, 409
+            self.client.delete(f"/api/groups/1?{self.q}").status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post("/api/photos/ungroup",
+                             json={"paths": ["C:/p.jpg"], **db}).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post("/api/rejected/clear",
+                             json={"paths": ["C:/p.jpg"], **db}).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post("/api/photos/ungroup",
+                             json={"paths": ["C:/p.jpg"], **db}).status_code,
+            409,
         )
         # The face is untouched and renames (safe) still work.
         self.assertTrue((self.g1 / "a_0.jpg").exists())
@@ -1093,6 +1110,9 @@ class DuplicatesTestCase(unittest.TestCase):
         self.assertEqual(members, sorted((pa, pb)))
         dist = body["sets"][0]["pairs"][0][2]
         self.assertEqual(dist, 1)
+        # Match percentage rides along: (64 - 1) / 64 * 100 = 98.4%.
+        self.assertEqual(body["sets"][0]["pairs"][0][3], 98.4)
+        self.assertEqual(body["sets"][0]["best_pct"], 98.4)
         # Dismiss hides it; undismiss brings it back.
         self.client.post("/api/duplicates/dismiss",
                          json={"pairs": [[pa, pb]], **self.db})
@@ -1130,7 +1150,7 @@ class DuplicatesTestCase(unittest.TestCase):
         Image.new("RGB", (100, 100), (10, 200, 30)).save(d1 / "same.jpg", "JPEG")
         shutil.copy(d1 / "same.jpg", d2 / "same.jpg")
         old = webmod.get_face_app
-        webmod.get_face_app = lambda: FakeApp()
+        webmod.get_face_app = lambda *a, **k: FakeApp()
         try:
             db2 = self.tmp / "pipe.db"
             out2 = self.tmp / "pout"
@@ -1178,6 +1198,550 @@ class DuplicatesTestCase(unittest.TestCase):
         bad.write_bytes(b"not-an-image-at-all")
         self.assertIsNone(dhash_of(str(bad)))
         self.assertIsNone(dhash_of(str(self.tmp / "missing.jpg")))
+
+
+class FacelessTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-faceless-"))
+        self.db_file = self.tmp / "state.db"
+        self.faced = self.tmp / "faced.jpg"
+        self.lonely = self.tmp / "lonely.jpg"
+        self.alias = self.tmp / "alias.jpg"
+        self.alias2 = self.tmp / "alias2.jpg"
+        for p in (self.faced, self.lonely, self.alias, self.alias2):
+            p.write_bytes(b"\xff\xd8fakejpg")
+        # ghost.jpg was processed but the file is gone.
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO processed_files(file_path, mtime, size) VALUES (?, 1.0, 10)",
+            [(str(self.faced),), (str(self.lonely),), (str(self.alias),),
+             (str(self.alias2),), (str(self.tmp / "ghost.jpg"),)],
+        )
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, 0, 'f_0', 0.1, 0.1, 0.2, 0.2, 1, 0)",
+            (str(self.faced),),
+        )
+        # alias.jpg is a skipped duplicate of faced.jpg (inherits faces);
+        # alias2.jpg aliases lonely.jpg (no faces anywhere).
+        conn.execute(
+            "INSERT INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+            (str(self.alias), str(self.faced)),
+        )
+        conn.execute(
+            "INSERT INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+            (str(self.alias2), str(self.lonely)),
+        )
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+        self.db = {"db_file": str(self.db_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_lists_only_truly_faceless(self):
+        body = self.client.get(f"/api/faceless?{self.q}").get_json()
+        paths = {p["path"] for p in body["photos"]}
+        self.assertEqual(
+            paths,
+            {str(self.lonely), str(self.alias2), str(self.tmp / "ghost.jpg")},
+        )
+        flags = {p["path"]: p["exists"] for p in body["photos"]}
+        self.assertTrue(flags[str(self.lonely)])
+        self.assertFalse(flags[str(self.tmp / "ghost.jpg")])
+
+    def test_faceless_missing_db_is_empty(self):
+        body = self.client.get(
+            "/api/faceless?db_file=" + str(self.tmp / "nope.db")).get_json()
+        self.assertEqual(body, {"photos": []})
+
+    def test_faceless_image_is_constrained_to_list(self):
+        # NOTE: DB-consistent separators (the UI round-trips DB paths verbatim,
+        # same convention as photo_in_group).
+        ok = self.client.get(
+            f"/api/faceless-image?{self.q}&path={str(self.lonely)}")
+        self.assertEqual(ok.status_code, 200)
+        # faced.jpg has faces -> only servable via its group, not here.
+        self.assertEqual(
+            self.client.get(
+                f"/api/faceless-image?{self.q}&path={str(self.faced)}").status_code,
+            404)
+        self.assertEqual(
+            self.client.get(
+                f"/api/faceless-image?{self.q}&path={self.tmp / 'nope.jpg'}").status_code,
+            404)
+
+    def test_reveal_allows_faceless_without_group(self):
+        from unittest import mock
+
+        with mock.patch("face_grouping_web.subprocess.Popen"):
+            allowed = self.client.post(
+                "/api/reveal",
+                json={"group_id": None, "path": str(self.lonely), **self.db})
+            self.assertEqual(allowed.status_code, 200)
+            denied = self.client.post(
+                "/api/reveal",
+                json={"group_id": None, "path": str(self.tmp / "stranger.jpg"),
+                      **self.db})
+            self.assertEqual(denied.status_code, 404)
+
+    def test_faceless_in_folders_filters(self):
+        from face_grouping_v5 import faceless_in_folders
+
+        d1 = self.tmp / "lib1"
+        d2 = self.tmp / "lib2"
+        d1.mkdir()
+        d2.mkdir()
+        p1 = d1 / "a.jpg"
+        p2 = d2 / "b.jpg"
+        p1.write_bytes(b"x")
+        p2.write_bytes(b"x")
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO processed_files(file_path, mtime, size) VALUES (?, 1.0, 1)",
+            [(str(p1.resolve()),), (str(p2.resolve()),), (str(d1 / "gone.jpg"),)],
+        )
+        conn.commit()
+        try:
+            self.assertEqual(faceless_in_folders(conn, [str(d1)]), [p1.resolve()])
+            both = faceless_in_folders(conn, [str(d1), str(d2)])
+            self.assertEqual(sorted(both), sorted([p1.resolve(), p2.resolve()]))
+        finally:
+            conn.close()
+
+    def test_run_rejects_bad_det_thresh(self):
+        r = self.client.post("/api/run", json={
+            "input_folders": [str(self.tmp)], "db_file": str(self.db_file),
+            "det_thresh": 99})
+        self.assertEqual(r.status_code, 400)
+
+    def test_run_only_faceless_needs_targets(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        r = self.client.post("/api/run", json={
+            "input_folders": [str(empty)], "db_file": str(self.db_file),
+            "only_faceless": True})
+        self.assertEqual(r.status_code, 400)
+        r2 = self.client.post("/api/run", json={
+            "input_folders": [str(self.tmp)],
+            "db_file": str(self.tmp / "nope.db"), "only_faceless": True})
+        self.assertEqual(r2.status_code, 400)
+
+    def test_run_only_faceless_refuses_already_scanned(self):
+        # lonely.jpg + alias2.jpg are faceless; record them scanned at 0.3.
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, ?)",
+            [(str(self.lonely), 0.3), (str(self.alias2), 0.3)],
+        )
+        conn.commit()
+        conn.close()
+        # Same threshold again -> refused with guidance, no run started.
+        r = self.client.post("/api/run", json={
+            "input_folders": [str(self.tmp)], "db_file": str(self.db_file),
+            "only_faceless": True, "det_thresh": 0.3})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("already scanned", r.get_json()["error"])
+        self.assertFalse(
+            self.client.get("/api/status").get_json()["running"])
+
+    def test_faceless_in_folders_respects_recorded_threshold(self):
+        from face_grouping_v5 import faceless_in_folders
+
+        d1 = self.tmp / "tlib1"
+        d2 = self.tmp / "tlib2"
+        d1.mkdir()
+        d2.mkdir()
+        p1 = d1 / "a.jpg"
+        p2 = d2 / "b.jpg"
+        p1.write_bytes(b"x")
+        p2.write_bytes(b"x")
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO processed_files(file_path, mtime, size) VALUES (?, 1.0, 1)",
+            [(str(p1.resolve()),), (str(p2.resolve()),)],
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, 0.5)",
+            (str(p1.resolve()),))
+        conn.execute(
+            "INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, 0.2)",
+            (str(p2.resolve()),))
+        conn.commit()
+        try:
+            # Unfiltered: both. At 0.3: only p1 (scanned 0.5 > 0.3).
+            self.assertEqual(
+                sorted(faceless_in_folders(conn, [str(d1), str(d2)])),
+                sorted([p1.resolve(), p2.resolve()]))
+            self.assertEqual(
+                faceless_in_folders(conn, [str(d1), str(d2)], 0.3),
+                [p1.resolve()])
+            self.assertEqual(
+                sorted(faceless_in_folders(conn, [str(d1), str(d2)], 0.1)),
+                sorted([p1.resolve(), p2.resolve()]))
+            self.assertEqual(
+                faceless_in_folders(conn, [str(d1), str(d2)], 0.5), [])
+        finally:
+            conn.close()
+
+    def test_faceless_lists_last_scan_det(self):
+        conn = open_db(str(self.db_file))
+        conn.execute(
+            "INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, 0.3)",
+            (str(self.lonely),))
+        conn.commit()
+        conn.close()
+        body = self.client.get(f"/api/faceless?{self.q}").get_json()
+        by_path = {p["path"]: p for p in body["photos"]}
+        self.assertEqual(by_path[str(self.lonely)]["last_det"], 0.3)
+        self.assertIsNone(by_path[str(self.alias2)]["last_det"])
+
+    def test_get_face_app_caches_per_det_thresh(self):
+        from unittest import mock
+
+        import face_grouping_web as webmod
+
+        old = dict(webmod._face_apps)
+        webmod._face_apps.clear()
+        try:
+            with mock.patch("insightface.app.FaceAnalysis") as FA:
+                made = []
+
+                def _make(*a, **k):
+                    m = mock.MagicMock()
+                    made.append(m)
+                    return m
+
+                FA.side_effect = _make
+                a1 = webmod.get_face_app(0.5)
+                a2 = webmod.get_face_app(0.5)
+                a3 = webmod.get_face_app(0.3)
+                self.assertIs(a1, a2)
+                self.assertIsNot(a1, a3)
+                self.assertEqual(len(made), 2)  # one load per threshold
+                used = sorted(
+                    c.kwargs.get("det_thresh")
+                    for m in made for c in m.prepare.call_args_list
+                )
+                self.assertEqual(used, [0.3, 0.5])
+        finally:
+            webmod._face_apps.clear()
+            webmod._face_apps.update(old)
+
+
+class BulkDbRoutingTestCase(unittest.TestCase):
+    """Regression: bulk move/delete must honor an explicit non-default db_file.
+
+    The UI once omitted db_file on these two calls, so with any database but
+    the default selected, deletes/moves silently hit processing_state.db —
+    surfacing as "Face file not found" for files that plainly exist.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-routing-"))
+        self.default_db = self.tmp / "processing_state.db"
+        self.selected_db = self.tmp / "sample.db"
+        self.default_dir = self.tmp / "default_faces" / "group_1"
+        self.selected_dir = self.tmp / "sample_faces" / "group_1"
+        self.selected_dir2 = self.tmp / "sample_faces" / "group_2"
+        for d in (self.default_dir, self.selected_dir, self.selected_dir2):
+            d.mkdir(parents=True)
+        make_face_file(self.default_dir, "d_0.jpg")
+        make_face_file(self.selected_dir, "s_0.jpg")
+        conn = open_db(str(self.default_db))
+        conn.execute(
+            "INSERT INTO groups(id, sum_embedding, count, directory) "
+            "VALUES (1, '', 1, ?)", (str(self.default_dir),))
+        conn.execute("INSERT INTO group_cropped_faces VALUES (1, 'd_0')")
+        conn.commit()
+        conn.close()
+        conn = open_db(str(self.selected_db))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory) VALUES (?, '', 1, ?)",
+            [(1, str(self.selected_dir)), (2, str(self.selected_dir2))],
+        )
+        conn.execute("INSERT INTO group_cropped_faces VALUES (1, 's_0')")
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES ('C:/p.jpg', 0, 's_0', 0.1, 0.1, 0.2, 0.2, 1, 0)"
+        )
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.sel = {"db_file": str(self.selected_db)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _faces(self, db, group_id):
+        conn = open_db(str(db))
+        try:
+            return {r[0] for r in conn.execute(
+                "SELECT face_id FROM group_cropped_faces WHERE group_id=?", (group_id,))}
+        finally:
+            conn.close()
+
+    def test_bulk_delete_hits_selected_db(self):
+        r = self.client.post("/api/faces/bulk-delete", json={
+            **self.sel, "items": [{"group_id": 1, "filename": "s_0.jpg"}]})
+        self.assertEqual(r.status_code, 200)
+        # Selected DB: face gone from folder and registry...
+        self.assertFalse((self.selected_dir / "s_0.jpg").exists())
+        self.assertEqual(self._faces(self.selected_db, 1), set())
+        # ...default DB completely untouched.
+        self.assertTrue((self.default_dir / "d_0.jpg").exists())
+        self.assertEqual(self._faces(self.default_db, 1), {"d_0"})
+
+    def test_bulk_delete_accepts_db_file_from_query(self):
+        r = self.client.post(
+            f"/api/faces/bulk-delete?db_file={self.selected_db.as_posix()}",
+            json={"items": [{"group_id": 1, "filename": "s_0.jpg"}]})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse((self.selected_dir / "s_0.jpg").exists())
+        self.assertTrue((self.default_dir / "d_0.jpg").exists())
+
+    def test_bulk_move_hits_selected_db(self):
+        r = self.client.post("/api/faces/bulk-move", json={
+            **self.sel,
+            "items": [{"group_id": 1, "filename": "s_0.jpg"}],
+            "target_group_id": 2})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue((self.selected_dir2 / "s_0.jpg").exists())
+        self.assertFalse((self.selected_dir / "s_0.jpg").exists())
+        self.assertEqual(self._faces(self.selected_db, 2), {"s_0"})
+        # Default DB untouched: its group 1 still has its face on disk and on record.
+        self.assertTrue((self.default_dir / "d_0.jpg").exists())
+        self.assertEqual(self._faces(self.default_db, 1), {"d_0"})
+
+    def test_frontend_sends_db_file_on_bulk_ops(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "static" / "js" / "ops.js").read_text(encoding="utf-8")
+        for fn in ("deleteFaces", "moveFaces"):
+            m = re.search(r"export async function " + fn + r"\b(.*?)\n}\n", src, re.S)
+            self.assertIsNotNone(m, f"{fn} not found in ops.js")
+            self.assertIn(
+                "db_file", m.group(1),
+                f"{fn} must send db_file (wrong-database regression)")
+
+
+class UngroupTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-ungroup-"))
+        self.db_file = self.tmp / "state.db"
+        out = self.tmp / "out"
+        self.g1 = out / "group_1"
+        self.g2 = out / "group_2"
+        self.g3 = out / "group_3"
+        for d in (self.g1, self.g2, self.g3):
+            d.mkdir(parents=True)
+        self.photoA = str(self.tmp / "a.jpg")  # 2 live faces, groups 1+2, crops on disk
+        self.photoB = str(self.tmp / "b.jpg")  # approved-style: live row, no crop file
+        self.photoC = str(self.tmp / "c.jpg")  # dup alias of photoA
+        make_face_file(self.g1, "aA_0.jpg")
+        make_face_file(self.g2, "aA_1.jpg")
+        (self.tmp / "a.jpg").write_bytes(b"x")
+        (self.tmp / "b.jpg").write_bytes(b"x")
+        (self.tmp / "c.jpg").write_bytes(b"x")
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory) VALUES (?, '', 1, ?)",
+            [(1, str(self.g1)), (2, str(self.g2)), (3, str(self.g3))],
+        )
+        conn.execute("INSERT INTO processed_files(file_path, mtime, size) VALUES (?, 1.0, 1), (?, 1.0, 1), (?, 1.0, 1)",
+                     (self.photoA, self.photoB, self.photoC))
+        conn.executemany(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, 0.1, 0.1, 0.4, 0.4, ?, 0)",
+            [(self.photoA, 0, "aA_0", 1), (self.photoA, 1, "aA_1", 2),
+             (self.photoB, 0, "bB_0", 3)],
+        )
+        conn.execute("INSERT INTO group_cropped_faces VALUES (1, 'aA_0'), (2, 'aA_1')")
+        conn.executemany(
+            "INSERT INTO group_image_paths VALUES (?, ?)",
+            [(1, self.photoA), (2, self.photoA), (3, self.photoB)],
+        )
+        conn.execute("INSERT INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+                     (self.photoC, self.photoA))
+        conn.commit()
+        conn.close()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.db = {"db_file": str(self.db_file)}
+        self.q = f"db_file={self.db_file.as_posix()}"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _detached(self, path):
+        conn = open_db(str(self.db_file))
+        try:
+            return [tuple(r) for r in conn.execute(
+                "SELECT face_id, detached FROM photo_faces WHERE image_path=? ORDER BY face_idx",
+                (path,))]
+        finally:
+            conn.close()
+
+    def test_ungroup_returns_photo_to_faceless(self):
+        r = self.client.post("/api/photos/ungroup",
+                             json={**self.db, "paths": [self.photoA]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["ungrouped"][0]["faces"], 2)
+        # Crops trashed, registries cleared, tags detached.
+        self.assertFalse((self.g1 / "aA_0.jpg").exists())
+        self.assertFalse((self.g2 / "aA_1.jpg").exists())
+        self.assertTrue(any((self.tmp / "out" / ".trash").glob("*.jpg")))
+        conn = open_db(str(self.db_file))
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM group_cropped_faces").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM group_image_paths WHERE image_path=?", (self.photoA,)).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM rejected_faces WHERE image_path=?", (self.photoA,)).fetchone()[0], 2)
+        finally:
+            conn.close()
+        self.assertEqual(self._detached(self.photoA), [("aA_0", 1), ("aA_1", 1)])
+        # ...and the photo is back in No-faces.
+        faceless = {p["path"] for p in
+                    self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertIn(self.photoA, faceless)
+
+    def test_ungroup_undo_restores_everything(self):
+        self.client.post("/api/photos/ungroup", json={**self.db, "paths": [self.photoA]})
+        u = self.client.post("/api/undo", json=self.db)
+        self.assertEqual(u.status_code, 200)
+        self.assertTrue((self.g1 / "aA_0.jpg").exists())
+        self.assertTrue((self.g2 / "aA_1.jpg").exists())
+        self.assertEqual(self._detached(self.photoA), [("aA_0", 0), ("aA_1", 0)])
+        conn = open_db(str(self.db_file))
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM group_cropped_faces").fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM group_image_paths WHERE image_path=?", (self.photoA,)).fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM rejected_faces WHERE image_path=?", (self.photoA,)).fetchone()[0], 0)
+        finally:
+            conn.close()
+        faceless = {p["path"] for p in
+                    self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertNotIn(self.photoA, faceless)
+
+    def test_ungroup_undo_survives_intervening_rescan(self):
+        # Ungroup, then simulate a rescan: it wipes tag rows (reset) and, with
+        # suppression active, adds none back. Undo must still fully restore.
+        self.client.post("/api/photos/ungroup", json={**self.db, "paths": [self.photoA]})
+        conn = open_db(str(self.db_file))
+        conn.execute("DELETE FROM photo_faces WHERE image_path=?", (self.photoA,))
+        conn.execute("INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, 0.2)",
+                     (self.photoA,))
+        conn.commit()
+        conn.close()
+        u = self.client.post("/api/undo", json=self.db)
+        self.assertEqual(u.status_code, 200)
+        self.assertTrue((self.g1 / "aA_0.jpg").exists())
+        self.assertTrue((self.g2 / "aA_1.jpg").exists())
+        self.assertEqual(self._detached(self.photoA), [("aA_0", 0), ("aA_1", 0)])
+        conn = open_db(str(self.db_file))
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM group_image_paths WHERE image_path=?",
+                (self.photoA,)).fetchone()[0], 2)
+        finally:
+            conn.close()
+        faceless = {p["path"] for p in
+                    self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertNotIn(self.photoA, faceless)
+
+    def test_suppression_helpers(self):
+        from face_grouping_v5 import is_suppressed
+
+        shape = (100, 200, 3)
+        # Identical box -> suppressed; far box -> kept; degenerate image -> kept.
+        self.assertTrue(is_suppressed((10, 10, 50, 50), shape, [(0.05, 0.1, 0.25, 0.5)]))
+        self.assertFalse(is_suppressed((150, 10, 190, 50), shape, [(0.05, 0.1, 0.25, 0.5)]))
+        self.assertFalse(is_suppressed((10, 10, 50, 50), (0, 0, 3), [(0.05, 0.1, 0.25, 0.5)]))
+        self.assertFalse(is_suppressed((10, 10, 50, 50), shape, []))
+
+    def test_ungroup_alias_unlinks_only(self):
+        r = self.client.post("/api/photos/ungroup",
+                             json={**self.db, "paths": [self.photoC]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["ungrouped"][0]["unlinked"], self.photoA)
+        conn = open_db(str(self.db_file))
+        try:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM duplicates WHERE dup_path=?", (self.photoC,)).fetchone())
+            # Canonical untouched: rows live, crops on disk.
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM photo_faces WHERE image_path=? AND detached=0",
+                (self.photoA,)).fetchone()[0], 2)
+        finally:
+            conn.close()
+        self.assertTrue((self.g1 / "aA_0.jpg").exists())
+        faceless = {p["path"] for p in
+                    self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertIn(self.photoC, faceless)
+        # Undo re-links the alias.
+        self.assertEqual(self.client.post("/api/undo", json=self.db).status_code, 200)
+        conn = open_db(str(self.db_file))
+        try:
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM duplicates WHERE dup_path=?", (self.photoC,)).fetchone())
+        finally:
+            conn.close()
+
+    def test_ungroup_approved_without_files(self):
+        r = self.client.post("/api/photos/ungroup",
+                             json={**self.db, "paths": [self.photoB]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._detached(self.photoB), [("bB_0", 1)])
+        faceless = {p["path"] for p in
+                    self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertIn(self.photoB, faceless)
+        self.assertEqual(self.client.post("/api/undo", json=self.db).status_code, 200)
+        self.assertEqual(self._detached(self.photoB), [("bB_0", 0)])
+
+    def test_rejected_clear_rearms_photo(self):
+        self.client.post("/api/photos/ungroup", json={**self.db, "paths": [self.photoA]})
+        conn = open_db(str(self.db_file))
+        conn.execute("INSERT OR REPLACE INTO scan_det(path, det_thresh) VALUES (?, 0.3)",
+                     (self.photoA,))
+        conn.commit()
+        conn.close()
+        before = {p["path"]: p for p in
+                  self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertEqual(before[self.photoA]["rejected"], 2)
+        r = self.client.post("/api/rejected/clear",
+                             json={**self.db, "paths": [self.photoA]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["cleared"],
+                         [{"photo": self.photoA, "faces": 2}])
+        after = {p["path"]: p for p in
+                 self.client.get(f"/api/faceless?{self.q}").get_json()["photos"]}
+        self.assertEqual(after[self.photoA]["rejected"], 0)
+        # Still faceless (no live faces) — but the scan record is gone, so the
+        # next rescan will reconsider it at any threshold.
+        self.assertIn(self.photoA, after)
+        conn = open_db(str(self.db_file))
+        try:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM scan_det WHERE path=?", (self.photoA,)).fetchone())
+        finally:
+            conn.close()
+
+    def test_rejected_clear_needs_paths(self):
+        self.assertEqual(
+            self.client.post("/api/rejected/clear", json=self.db).status_code, 400)
+
+    def test_ungroup_nothing_to_do(self):
+        r = self.client.post("/api/photos/ungroup",
+                             json={**self.db, "paths": [str(self.tmp / "ghost.jpg")]})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post("/api/photos/ungroup", json=self.db)
+        self.assertEqual(r.status_code, 400)
 
 
 if __name__ == "__main__":
