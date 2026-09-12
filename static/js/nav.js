@@ -7,27 +7,31 @@ import { getFacelessCount } from "./faceless.js";
 
 const PAGE_KEY = "facedeck-page";
 
+const PAGES = ["people", "review", "search"];
+
 function pageFromHash() {
     const h = (window.location.hash || "").replace(/^#\/?/, "");
-    return h === "review" ? "review" : null;
+    return PAGES.includes(h) ? h : null;
 }
 
 function savedPage() {
     try {
-        return localStorage.getItem(PAGE_KEY) === "review" ? "review" : null;
+        const p = localStorage.getItem(PAGE_KEY);
+        return PAGES.includes(p) ? p : null;
     } catch (_) {
         return null;
     }
 }
 
 export function currentPage() {
-    return document.querySelector("#page-review")?.classList.contains("hidden")
-        ? "people"
-        : "review";
+    for (const n of PAGES) {
+        if (!document.querySelector(`#page-${n}`)?.classList.contains("hidden")) return n;
+    }
+    return "people";
 }
 
 export function showPage(name, push = false) {
-    if (name !== "review") name = "people";
+    if (!PAGES.includes(name)) name = "people";
     for (const p of document.querySelectorAll(".page")) {
         p.classList.toggle("hidden", p.id !== `page-${name}`);
     }

@@ -24,6 +24,11 @@ Works with `JPG / JPEG / PNG / BMP / TIFF / WEBP / HEIC / HEIF`, including iPhon
 | ![Duplicates panel](docs/screenshots/04-duplicates.png) | ![Light theme](docs/screenshots/05-light-theme.png) |
 | Lookalike sets with match % and Link checked / Keep all separate, plus No-faces with detection picker and Rescan faceless | Theme toggle is remembered in the browser |
 
+| Search by example |
+|---|
+| ![Search by example](docs/screenshots/06-search.png) |
+| Upload any photo — every face is ranked against your people with similarity scores; click a match to jump to them |
+
 To reproduce these shots with the same demo data (the `Sample_Data/` folder is git-ignored, so download it first or use your own photos):
 
 ```bash
@@ -53,7 +58,8 @@ python face_grouping_web.py
 - Cancel button saves progress so far
 
 ### Review UI (web, recommended)
-- Two tabs keep things uncluttered: **People** (browse + curate) and **Review** (duplicates + no-faces, with a count badge so open items don't get ignored); tab choice is remembered and hash-routed (`#/people`, `#/review`)
+- Three tabs keep things uncluttered: **People** (browse + curate), **Review** (duplicates + no-faces, with a count badge so open items don't get ignored), and **Search** (search by example); tab choice is remembered and hash-routed (`#/people`, `#/review`, `#/search`)
+- **Search by example** tab: drop in any photo — or capture one with your camera (device picker, live preview; works on localhost/HTTPS) — every detected face is ranked against all people with similarity scores and a would-join/below-threshold hint; click a match to jump to that person. Read-only: nothing is stored, grouped or trashed
 - Fast **People list** — no images loaded up front, safe for thousands of photos
 - Search by name, filter **All / Pending / Approved**, min-photos filter, sort (Default, Name A–Z, Most/Fewest photos, Newest), pagination
 - Person detail: face count, photo count, folder path, **rename** (stored in DB)
@@ -147,7 +153,8 @@ python face_grouping_web.py
 4. **Person detail**: rename at the top, `View` face crops (paginated), review the auto-loaded source-photo list (`Preview` / `Reveal` / `Ungroup` per photo), `Open folder` for the group folder.
 5. **Fix mistakes**: select faces (Ctrl/Shift-click) → Move / Delete via the bottom bulk bar, or drag a tile onto another person in the list. `Undo` reverts the last batch.
 6. **Review tab**: Duplicates card → `Refresh`, optionally `Find possibly-same` → link or keep; No faces detected → `Rescan faceless` at a lower detection threshold, or `Allow again` for previously rejected faces.
-7. **Approve** people you're happy with, then **Export CSV/JSON**.
+7. **Search tab**: drop in any photo to find which person each face belongs to.
+8. **Approve** people you're happy with, then **Export CSV/JSON**.
 
 ### B. CLI (scripting / headless)
 
@@ -291,7 +298,7 @@ facedeck/
 python -m pytest tests/ -q
 ```
 
-Covers the web API (groups, faces/photos pagination, rename, move/delete/undo guards, duplicates, faceless + ungroup + rejection allow-again, bulk DB routing, detection-threshold guards, export).
+Covers the web API (groups, faces/photos pagination, rename, move/delete/undo guards, duplicates, faceless + ungroup + rejection allow-again, bulk DB routing, detection-threshold guards, search ranking, export).
 
 ---
 

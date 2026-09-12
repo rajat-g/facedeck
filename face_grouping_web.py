@@ -1929,6 +1929,136 @@ def api_faceless_image():
         conn.close()
 
 
+# ---------- Search by example (upload a photo, find matching people) ----------
+
+_SEARCH_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "heic", "heif"}
+_SEARCH_MAX_BYTES = 15 * 1024 * 1024
+_SEARCH_TOP_N = 5
+
+
+def _data_url_jpeg(img, max_dim=640, quality=82):
+    """Downscaled JPEG data URL for inline display, or None on failure."""
+    try:
+        h, w = img.shape[:2]
+        scale = min(1.0, max_dim / max(h, w))
+        if scale < 1.0:
+            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if not ok:
+            return None
+        import base64
+
+        return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _crop_thumb(img, bbox, max_dim=256):
+    """Face-crop data URL for identifying one query face, else None."""
+    try:
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x1 >= x2 or y1 >= y2:
+            return None
+        return _data_url_jpeg(img[y1:y2, x1:x2], max_dim=max_dim, quality=80)
+    except Exception:
+        return None
+
+
+@app.route("/api/search", methods=["POST"])
+def api_search():
+    """Search by example: upload a photo, get ranked matching people per face.
+
+    Multipart form: image=<file>, db_file, threshold (default 0.6, only used
+    for the per-match `join` hint). Read-only: nothing is stored, grouped or
+    trashed. Faces are matched against current group-average embeddings.
+    """
+    import tempfile
+
+    db_file = (request.form.get("db_file") or "").strip() or "processing_state.db"
+    try:
+        threshold = float(request.form.get("threshold", 0.6))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid threshold"}), 400
+
+    upload = request.files.get("image")
+    if upload is None or not upload.filename:
+        return jsonify({"error": "No image uploaded"}), 400
+    ext = (upload.filename.rsplit(".", 1)[-1] if "." in upload.filename else "").lower()
+    if ext not in _SEARCH_EXTENSIONS:
+        return jsonify({"error": f"Unsupported image type .{ext or '?'} "
+                                 f"(jpg, png, webp, bmp, heic)"}), 400
+    raw = upload.read()
+    if not raw:
+        return jsonify({"error": "Uploaded file is empty"}), 400
+    if len(raw) > _SEARCH_MAX_BYTES:
+        return jsonify({"error": "Image too large (15 MB max)"}), 400
+
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                suffix=f".{ext}", prefix="facedeck-search-", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        img = read_image(tmp_path)
+        if img is None:
+            return jsonify({"error": "Could not decode image"}), 400
+        h, w = img.shape[:2]
+
+        try:
+            face_app = get_face_app()
+        except Exception as exc:
+            return jsonify({"error": f"Face engine unavailable: {exc}"}), 500
+        query_faces = face_app.get(img)
+        if not query_faces:
+            return jsonify({"error": "No faces detected in the uploaded image"}), 400
+
+        conn = open_db(db_file)
+        try:
+            _, _, groups = load_processed_state(db_file)
+        finally:
+            conn.close()
+        matchable = []
+        for g in groups:
+            if g["sum_embedding"] is None or g["count"] <= 0:
+                continue
+            avg = g["sum_embedding"] / g["count"]
+            name = g.get("name") or Path(g["directory"]).name
+            matchable.append((g["id"], name, avg))
+
+        faces = []
+        for idx, face in enumerate(query_faces):
+            scored = []
+            for gid, name, avg in matchable:
+                try:
+                    score = round(float(cosine_similarity(face.embedding, avg)), 4)
+                except Exception:
+                    continue
+                scored.append({"group_id": gid, "name": name,
+                               "score": score, "join": score >= threshold})
+            scored.sort(key=lambda m: m["score"], reverse=True)
+            x1, y1, x2, y2 = (float(v) for v in face.bbox)
+            faces.append({
+                "index": idx,
+                "thumb": _crop_thumb(img, face.bbox),
+                "bbox": [x1 / w, y1 / h, x2 / w, y2 / h] if h > 0 and w > 0 else None,
+                "matches": scored[:_SEARCH_TOP_N],
+            })
+        return jsonify({"faces": faces, "image": _data_url_jpeg(img),
+                        "detected": len(faces)})
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 # ---------- Duplicates (exact aliases + near-dupe review) ----------
 
 def _groups_for_photo(conn, image_path):

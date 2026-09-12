@@ -1744,6 +1744,126 @@ class UngroupTestCase(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class SearchTestCase(unittest.TestCase):
+    def setUp(self):
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-search-"))
+        self.db_file = self.tmp / "state.db"
+        ones = np.ones(512, dtype=np.float32)
+        alt = np.array([1.0 if i % 2 == 0 else -1.0 for i in range(512)],
+                       dtype=np.float32)
+        g1dir = self.tmp / "out" / "group_1"
+        g2dir = self.tmp / "out" / "group_2"
+        g1dir.mkdir(parents=True)
+        g2dir.mkdir(parents=True)
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(1, ",".join(map(str, (ones * 2).tolist())), 2, str(g1dir), "Alice"),
+             (2, ",".join(map(str, (alt * 2).tolist())), 2, str(g2dir), None)],
+        )
+        conn.commit()
+        conn.close()
+        buf = io.BytesIO()
+        Image.new("RGB", (120, 120), (10, 200, 30)).save(buf, "JPEG")
+        self.jpg = buf.getvalue()
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.np = np
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _upload(self, **kw):
+        import io
+
+        import face_grouping_web as webmod
+
+        np = self.np
+
+        class FakeFace:
+            def __init__(self, emb):
+                self.embedding = emb
+                self.bbox = np.array([10.0, 10.0, 50.0, 50.0])
+
+        faces = kw.pop("faces", [FakeFace(np.ones(512, dtype=np.float32))])
+
+        class FakeApp:
+            def get(self, img):
+                return faces
+
+        old = webmod.get_face_app
+        webmod.get_face_app = lambda *a, **k: FakeApp()
+        try:
+            data = {"image": (io.BytesIO(self.jpg), "q.jpg"),
+                    "db_file": str(self.db_file)}
+            data.update(kw)
+            return self.client.post("/api/search", data=data,
+                                    content_type="multipart/form-data")
+        finally:
+            webmod.get_face_app = old
+
+    def test_search_ranks_groups(self):
+        r = self._upload(threshold="0.6")
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertEqual(body["detected"], 1)
+        self.assertTrue(body["image"].startswith("data:image/jpeg;base64,"))
+        face = body["faces"][0]
+        self.assertTrue(face["thumb"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual([m["group_id"] for m in face["matches"]], [1, 2])
+        self.assertAlmostEqual(face["matches"][0]["score"], 1.0, places=3)
+        self.assertEqual(face["matches"][0]["name"], "Alice")
+        self.assertEqual(face["matches"][1]["name"], "group_2")
+        self.assertTrue(face["matches"][0]["join"])
+        self.assertFalse(face["matches"][1]["join"])
+
+    def test_search_threshold_hint(self):
+        body = self._upload(threshold="2.0").get_json()
+        self.assertFalse(any(m["join"] for m in body["faces"][0]["matches"]))
+
+    def test_search_no_faces(self):
+        r = self._upload(faces=[])
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("No faces", r.get_json()["error"])
+
+    def test_search_camera_wiring_present(self):
+        # The camera flow must stay optional (hidden without getUserMedia),
+        # handle missing/denied cameras, and always release the stream.
+        src = (Path(__file__).resolve().parent.parent
+               / "static" / "js" / "search.js").read_text(encoding="utf-8")
+        for snippet in ("navigator.mediaDevices?.getUserMedia",
+                        "NotFoundError",
+                        "getTracks().forEach",
+                        "srcObject = null"):
+            self.assertIn(snippet, src,
+                          f"search.js must contain {snippet!r} (camera flow)")
+
+    def test_search_bad_requests(self):
+        import io
+
+        db = {"db_file": str(self.db_file)}
+        r = self.client.post("/api/search", data=dict(db),
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(
+            "/api/search",
+            data={"image": (io.BytesIO(b"nope"), "q.txt"), **db},
+            content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(
+            "/api/search",
+            data={"image": (io.BytesIO(self.jpg), "q.jpg"),
+                  "db_file": str(self.tmp / "nope.db")},
+            content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -533,6 +533,35 @@ body.is-running .delete-group { opacity: 0.45; pointer-events: none; }
   border-radius: 999px; padding: 3px 10px; white-space: nowrap; flex-shrink: 0;
 }
 .photo-row .link-check { flex-shrink: 0; width: 16px; height: 16px; }
+/* Search by example */
+.dropzone {
+  border: 1.5px dashed var(--line-strong); border-radius: 12px;
+  padding: 26px; text-align: center; color: var(--muted); background: var(--bg);
+}
+.dropzone.drag { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.search-query { position: relative; line-height: 0; max-width: 640px; margin: 14px 0; }
+.search-query > img { width: 100%; border-radius: 12px; border: 1px solid var(--line); }
+.face-tag-box.search-num .face-tag-name { opacity: 1; transform: none; }
+.search-face { border: 1px solid var(--line); border-radius: 12px; margin-top: 12px; overflow: hidden; }
+.search-face-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--bg-soft); border-bottom: 1px solid var(--line); }
+.search-face-head img { width: 56px; height: 56px; object-fit: cover; border-radius: 10px; border: 1px solid var(--line); }
+.search-matches { display: flex; flex-direction: column; }
+.search-match {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: transparent; border: none; border-bottom: 1px solid var(--line);
+  padding: 10px 12px; color: var(--text); cursor: pointer; font: 600 13px inherit;
+}
+.search-match:last-child { border-bottom: none; }
+.search-match:hover { background: var(--bg-soft); }
+.search-match .person-name { flex: 1; }
+/* Camera capture */
+#camera-box { margin-top: 12px; }
+#camera-video {
+  width: 100%; max-width: 640px; border-radius: 12px;
+  border: 1px solid var(--line); background: #000;
+}
+.camera-bar { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.camera-bar select { width: auto; max-width: 260px; }
 /* Stacked photo rows (name over folder): a real two-line layout so filenames,
    folders and status text can never mush into one unreadable line, and long
    paths truncate with an ellipsis instead of breaking the row. */

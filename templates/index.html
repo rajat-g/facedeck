@@ -24,6 +24,7 @@
                 <nav class="topnav" aria-label="Pages">
                     <button data-page="people" class="topnav-btn active">People</button>
                     <button data-page="review" class="topnav-btn">Review <span id="nav-review-badge" class="nav-badge" hidden></span></button>
+                    <button data-page="search" class="topnav-btn">Search</button>
                 </nav>
                 <div id="header-stat" class="header-stat hidden">
                     <span class="dot" aria-hidden="true"></span>
@@ -218,6 +219,31 @@
             </div>
             <p class="muted small dupe-hint">Processed photos where no face was found — grouped nowhere, lost nowhere. Lower the detection threshold and rescan just these; the rest of the library is skipped.</p>
             <div id="faceless-list"></div>
+        </section>
+        </div>
+
+        <!-- Page: Search by example -->
+        <div id="page-search" class="page hidden">
+        <section class="card" aria-label="Search by example">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">Search by example</h2>
+            </div>
+            <p class="muted small dupe-hint">Upload a photo — every face in it is compared against your people. Nothing is stored, grouped or trashed.</p>
+            <div id="search-drop" class="dropzone">
+                <input type="file" id="search-file" accept=".jpg,.jpeg,.png,.webp,.bmp,.heic,.heif" hidden>
+                <div>Drop a photo here, or <button type="button" id="search-choose" class="btn">Choose photo…</button>
+                <button type="button" id="search-use-camera" class="btn">Use camera…</button></div>
+                <div class="muted small" style="margin-top:6px">JPG, PNG, WebP, BMP or HEIC · 15 MB max</div>
+            </div>
+            <div id="camera-box" class="hidden">
+                <video id="camera-video" autoplay playsinline muted></video>
+                <div class="camera-bar">
+                    <select id="camera-select" class="hidden" title="Choose camera"></select>
+                    <button type="button" id="camera-capture" class="btn primary">Capture &amp; search</button>
+                    <button type="button" id="camera-cancel" class="btn ghost">Cancel</button>
+                </div>
+            </div>
+            <div id="search-results"></div>
         </section>
         </div>
 

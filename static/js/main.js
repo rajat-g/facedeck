@@ -8,6 +8,7 @@ import { initGroups, loadGroups, selectPerson } from "./groups.js";
 import { initDuplicates, loadDuplicates } from "./duplicates.js";
 import { initFaceless, loadFaceless } from "./faceless.js";
 import { initNav } from "./nav.js";
+import { initSearch } from "./search.js";
 import { startFacelessRescan } from "./run.js";
 import { closeLightbox, initLightbox, lightboxIsOpen, lightboxNavigate, openFaceViewer } from "./lightbox.js";
 import { closeMoveModal, initMoveModal, moveModalIsOpen, openMoveModal } from "./movemodal.js";
@@ -135,6 +136,7 @@ initLightbox(loadGroups);
 initMoveModal(loadGroups);
 initDuplicates(loadGroups);
 initFaceless(startFacelessRescan);
+initSearch();
 initNav();
 
 loadSettings();
