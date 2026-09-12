@@ -10,3 +10,5 @@ processing_state.db
 processing_state.json
 results.txt
 .cursor/
+Sample_Data/
+.opencode/

@@ -1,126 +1,289 @@
-# Face Grouping Application
+# FaceDeck — Automatic Face Grouping & Photo Organizer
 
-This application uses InsightFace to detect and group similar faces from a collection of images. It supports various image formats including HEIC/HEIF and common image formats.
+> Group thousands of photos by **who is in them**. Face detection + clustering with InsightFace, duplicate detection, and a fast web UI for review and curation.
+
+**Search keywords:** face grouping, face clustering, group photos by person, sort photos by face, InsightFace photo organizer, face recognition for local photo library, find duplicate photos, HEIC face detection, organize iPhone photos by person.
+
+FaceDeck scans one or more photo folders, detects faces, and clusters similar faces into **People** (`group_1`, `group_2`, …). You then rename, merge/split, approve, and export — all locally, no cloud upload.
+
+Works with `JPG / JPEG / PNG / BMP / TIFF / WEBP / HEIC / HEIF`, including iPhone HEIC and EXIF-rotated photos.
+
+---
+
+## Screenshots
+
+> Captured from a real run on freely-available demo photos ([randomuser.me](https://randomuser.me) portraits + [Unsplash](https://unsplash.com) group shots): 19 photos → 17 faces → 15 people. No personal photos are shown.
+
+| Setup & Run | People review | Photo with face tags |
+|---|---|---|
+| ![Setup and run panel](docs/screenshots/01-setup-run.png) | ![People list and person detail](docs/screenshots/02-people-detail.png) | ![Face tags on source photo](docs/screenshots/03-face-tags.png) |
+| Point at folders, pick threshold, start a run | Rename, filter, approve, move/delete faces (here: two resolutions of one person correctly grouped) | Hover a box to see the name, click to jump to that person |
+
+| Duplicates panel | Dark / light theme |
+|---|---|
+| ![Duplicates panel](docs/screenshots/04-duplicates.png) | ![Light theme](docs/screenshots/05-light-theme.png) |
+| Perceptual-hash lookalike sets with Link / Keep both (same photo at two sizes, found automatically) | Theme toggle is remembered in the browser |
+
+To reproduce these shots with the same demo data (the `Sample_Data/` folder is git-ignored, so download it first or use your own photos):
+
+```bash
+python face_grouping_v5.py --input_folder Sample_Data/photos --output_faces Sample_Data/faces --db_file Sample_Data/sample.db
+python face_grouping_web.py
+# open http://127.0.0.1:5000, set Database file to Sample_Data/sample.db, Refresh
+```
+
+---
 
 ## Features
 
-- Face detection and embedding extraction using InsightFace
-- Support for multiple image formats (JPG, JPEG, PNG, BMP, TIFF, WEBP, HEIC, HEIF)
-- Automatic face grouping based on similarity
-- Cropped face images saved for each group
-- State tracking to resume processing
-- Progress tracking and incremental processing
+### Detection & grouping
+- Face detection + embeddings with **InsightFace `buffalo_l`** (auto-downloaded on first run)
+- Cosine-similarity clustering with adjustable **threshold slider (0.30–0.90, default 0.60)**
+- **Multiple input folders** per run
+- **EXIF orientation normalized** at detection and serving time, so crops and boxes line up
+- Stable **face IDs** (`photo-stem + folder-hash + index`) — same filenames in different folders don't collide
 
-## Requirements
+### Incremental & resumable
+- **SQLite state DB** (`processing_state.db`) tracks processed files by `mtime + size`
+- Re-runs only scan **new/changed photos**
+- **Live checkpoints** every 100 photos / 20 s — people stream into the UI during a run
+- Run header states the **resolved DB path + existing people count**, warns on a **brand-new DB** or **input folders differing from last run**
+- Cancel button saves progress so far
 
-- Python 3.10+ (3.12 recommended)
-- CUDA-compatible GPU (recommended) or CPU
-- Required Python packages:
-  - opencv-python
-  - numpy
-  - insightface
-  - pillow-heif
-  - flask
+### Review UI (web, recommended)
+- Fast **People list** — no images loaded up front, safe for thousands of photos
+- Search by name, filter **All / Pending / Approved**, min-photos filter, sort (Default, Name A–Z, Most/Fewest photos, Newest), pagination
+- Person detail: face count, photo count, folder path, **rename** (stored in DB)
+- Face crops: **paginated, lazy-loaded grid**, click-to-view (never auto-loads everything)
+- Source photos: **text-row list by default** (zero images), optional thumbnail grid, per-photo **Preview** (single-image viewer) + **Reveal** (opens Explorer / Finder / file manager on the server), **Open folder** for the whole group
+- **Lightbox viewer** with prev/next, counter, and the source photo(s) each face came from
+- **Facebook-style face tags**: hover boxes with names on source photos, click a tag to open that person
+- **Copy all source photo paths** of a group to clipboard
+- **Stats chips**: photos processed, faces, largest groups
+- **Dark / light theme**, remembered in `localStorage`; responsive layout
+
+### Curation (correct mistakes)
+- Move faces: single move dialog, **bulk move** (Ctrl-click / Shift-click multi-select), or **drag-and-drop between groups**; create new group on the fly (named or auto `group_N`)
+- Moving a crop also moves its **source photo's group link** via face tags; a photo leaves its old group only when none of its faces remain there
+- **Delete** crops to a `.trash` folder (undoable); deleting unlinks the photo the same way
+- **Approve / Approve all**: approved people are done; face crops are cleaned up, photos stay listed
+- **Delete empty groups only** (no faces, no photos) from the detail panel, with undo
+- **Undo** last move / delete / group-delete (50 entries kept)
+- Curation **pauses during a run** (409 + visual lock) so checkpoints can't clobber edits; renames stay allowed
+- **Keyboard shortcuts**: arrows navigate faces, `Enter` opens lightbox, `M` moves, `Delete` removes, `Esc` closes dialogs
+
+### Duplicates
+- **Exact duplicates** (SHA-256 content hash) auto-detected, **linked not rescanned**, shown in the same groups automatically
+- **Duplicates panel** lists copy sets; delete sends copies to the **OS Recycle Bin / Trash** (`send2trash`)
+- **Find possibly-same** (perceptual `dHash`) lookalike scan with Strict (6) / Balanced (10) / Loose (14) modes for side-by-side review — **link as same, or keep both / dismiss**
+- Source photos are **never deleted inside the app except via that panel**
+
+### Export & interfaces
+- Export groups as **CSV or JSON** (group id, name, directory, face + source-photo lists)
+- Three interfaces: **Web UI** (`face_grouping_web.py`, recommended), **CLI** (`face_grouping_v5.py`), **Desktop GUI** (`face_grouping_gui.py`, Tkinter)
+- Cross-platform Reveal: Windows Explorer `/select`, macOS Finder `-R`, Linux `xdg-open` / `gio`
+
+---
+
+## Quickstart (3 steps)
+
+```bash
+# 1. Install (Python 3.10+, 3.12 recommended)
+pip install -r requirements.txt
+
+# 2. Run the web app
+python face_grouping_web.py
+
+# 3. Open in your browser
+# http://127.0.0.1:5000
+```
+
+Then: `Setup & Run` → add input folder(s) → `Start grouping` → select a person → rename / move / delete / approve → `Export CSV/JSON`.
+
+First run downloads the InsightFace `buffalo_l` model (~300 MB) automatically.
+
+---
 
 ## Installation
 
-1. Install the required packages:
+### Prerequisites
+- **Python 3.10+** (3.12 recommended). Check with `python --version`.
+- ~1 GB free for models + face crops.
+- Optional: **NVIDIA GPU + CUDA** for faster processing. CPU works, just slower.
+
+### Install dependencies
+
 ```bash
-pip install opencv-python numpy insightface pillow-heif flask
+pip install -r requirements.txt
 ```
 
-2. Download the InsightFace model (buffalo_l) - this will be done automatically on first run
+`requirements.txt` includes: `opencv-python`, `numpy`, `insightface`, `pillow`, `pillow-heif`, `flask`, `tqdm`, `pathvalidate`, `imagehash`, `send2trash`.
+
+Notes:
+- **Windows**: plain `pip install -r requirements.txt` works. If `insightface` fails to build, upgrade pip first: `python -m pip install -U pip`.
+- **macOS**: `pip install -r requirements.txt`. HEIC works via `pillow-heif`. Reveal uses Finder.
+- **Linux**: you may need system libs for OpenCV/HEIF first, e.g. on Debian/Ubuntu: `sudo apt install libgl1 libglib2.0-0`. Reveal uses `xdg-open` / `gio`.
+- **GPU (optional)**: install CUDA + cuDNN matching your `onnxruntime` build and keep `CUDAExecutionProvider` first (already configured). The app falls back to CPU automatically.
+
+---
 
 ## Usage
 
-### Web app (recommended)
+### A. Web app (recommended)
 
 ```bash
 python face_grouping_web.py
+# open http://127.0.0.1:5000
 ```
 
-Then open http://127.0.0.1:5000 in your browser.
+1. **Setup & Run**: paste one folder per line (or `Add…` for a native folder dialog), set output faces folder + DB file, pick threshold.
+2. **Start grouping**: watch the progress bar, counts, and log. People appear while it runs. Use **Cancel** to stop safely.
+3. **People**: search / filter / sort on top, click a person on the left.
+4. **Person detail**: rename at the top, `View` face crops (paginated), expand source-photo rows only when needed, `Preview` / `Reveal` individual photos, `Open folder` for the group folder.
+5. **Fix mistakes**: select faces (Ctrl/Shift-click) → Move / Delete via the bottom bulk bar, or drag a tile onto another person in the list. `Undo` reverts the last batch.
+6. **Duplicates**: open the Duplicates card → `Refresh`, optionally `Find possibly-same` → link or dismiss.
+7. **Approve** people you're happy with, then **Export CSV/JSON**.
 
-The web UI lets you:
-- Pick input folders (multiple supported) and DB file with native folder/file dialogs
-- Start grouping with a live progress bar, log, and a cancel button
-- Watch people stream in during the run (progress checkpoints every 100 photos / 20s)
-  — curation (move, delete, approve, undo) pauses during a run so checkpoints
-  can't clobber it, and unlocks when the run finishes
-- Starting a run states the resolved database path and existing people count,
-  and warns about a brand-new database or input folders that differ from the
-  database's last run (groups belong to the DB, not the folder)
-- Browse people as a fast list (no images loaded up front — safe for thousands of photos)
-- Select a person to see counts: the source-photo list opens automatically
-  (text rows, zero images), while face crops stay click-to-view. Thumbs mode
-  stays click-to-view too, since it loads real images
-  - Face crops: click "View on UI" for a paginated, lazy-loaded grid, or keep previews off
-  - Every photo has Preview (single-image viewer) plus Reveal (opens Explorer
-    on the server); "Open folder" reveals the whole group folder without
-    loading anything in the browser
-- Name people (stored in the database) shown on group cards
-- View a face in a lightbox together with the source photo(s) it came from
-- Face tags on source photos: hover boxes with names (Facebook-style), click a tag to open that person
-- Remove incorrect/unwanted faces (moved to a `.trash` folder) and undo moves/deletes
-- Delete fully empty groups (no faces, no photos) from the detail panel, with undo
-- Duplicates: bit-identical photos are detected by content hash, skipped on
-  rescan, and shown in the same groups automatically; the Duplicates panel
-  lists copy sets (delete sends copies to the OS Recycle Bin) and can scan
-  for "possibly the same" lookalikes (perceptual hash) for side-by-side
-  review — link as same, or keep both. Source photos are never deleted
-  inside the app except via that panel
-- Select multiple faces (Ctrl-click / Shift-click) or drag-and-drop them between groups.
-  Moving a crop also moves its source photo's group link (via face tags);
-  a photo leaves its old group only when none of its faces remain there.
-  Deleting a crop unlinks its photo the same way. Approve keeps photos listed
-- Copy all source photo paths of a group to the clipboard
-- See stats (photos processed, faces, largest groups)
-- Export groups as CSV or JSON
-- Toggle dark/light theme; settings are remembered in localStorage
-- Keyboard shortcuts: arrow keys navigate faces, Enter opens lightbox,
-  M moves, Delete removes, Esc closes dialogs
+### B. CLI (scripting / headless)
 
-### CLI
-
-Basic usage:
 ```bash
+# Minimal
 python face_grouping_v5.py --input_folder /path/to/images
-```
 
-Full options:
-```bash
+# Full
 python face_grouping_v5.py \
-    --input_folder /path/to/images \
-    --output_faces output_faces \
-    --threshold 0.6 \
-    --db_file processing_state.db
+  --input_folder /path/to/images \
+  --output_faces output_faces \
+  --threshold 0.6 \
+  --db_file processing_state.db
 ```
 
-### Parameters
+| Flag | Required | Default | Meaning |
+|---|---|---|---|
+| `--input_folder` | Yes | — | Folder scanned recursively for images |
+| `--output_faces` | No | `output_faces` | Where cropped faces are saved (`group_N/*.jpg`) |
+| `--threshold` | No | `0.6` | Cosine similarity to join a group. Higher = stricter (more people). Lower = lenient (fewer, merged people). |
+| `--db_file` | No | `processing_state.db` | SQLite state file for resume + tags + names |
 
-- `--input_folder`: (Required) Path to the folder containing images
-- `--output_faces`: (Optional) Directory to save cropped face images (default: output_faces)
-- `--threshold`: (Optional) Cosine similarity threshold for grouping (default: 0.6)
-- `--db_file`: (Optional) SQLite database file to track processed images (default: processing_state.db)
+### C. Desktop GUI (Tkinter)
 
-## Output
+```bash
+python face_grouping_gui.py
+```
 
-1. `output_faces/`: Directory containing subdirectories for each face group with cropped face images
-2. `processing_state.db`: SQLite database tracking processed files, groups, and per-photo face-tag boxes for incremental processing (use Export in the web UI for CSV/JSON reports)
+Pick input/output/DB with Browse buttons, drag the threshold slider, `Start grouping`, then browse groups and thumbnails. Renaming is supported; full curation (move/delete/duplicates/tags) lives in the web app.
 
-Face tags are recorded during grouping (normalised boxes + owning group per face).
-Tags follow renames and moves, survive "approve", and are hidden for trashed faces.
-Photos processed before tagging show no boxes until re-processed.
-EXIF orientation is normalised at detection and serving time so boxes land correctly.
+---
 
-Face IDs embed a short hash of the photo's folder, so same-named photos in
-different folders no longer share an identity. Databases and output folders
-created before this change use the old `stem_index` format — rebuild them
-from scratch (fresh `.db` + fresh faces folder, then re-run).
+## Threshold guide
 
-## Notes
+| Value | Behavior | When to use |
+|---|---|---|
+| `0.70–0.90` | Strict, splits into more people | Lookalikes / family members getting merged |
+| `0.55–0.65` | Balanced (start with `0.60`) | Most personal libraries |
+| `0.30–0.50` | Lenient, merges aggressively | Same person split across lighting/age, then split manually |
 
-- Higher threshold values (closer to 1.0) will create more strict face grouping
-- Lower threshold values (closer to 0.0) will create more lenient face grouping
-- The application can be stopped and resumed using the state database
-- Processing large image collections may take significant time depending on your hardware 
+You can re-run with a different threshold — only new/changed photos are reprocessed; existing groups are kept and matched against.
+
+---
+
+## How it works
+
+1. **Discover**: recursively list images (`jpg/jpeg/png/bmp/tiff/webp/heic/heif`), skip unchanged files via `(mtime, size)`.
+2. **Deduplicate**: SHA-256 exact-match check → alias registered in `duplicates`, file skipped (not re-encoded).
+3. **Detect + embed**: `read_image` (HEIC + EXIF-aware) → InsightFace `buffalo_l` → bbox + 512-d embedding per face.
+4. **Cluster**: cosine similarity vs. running group average → join best group if `≥ threshold`, else create `group_N`. Crop saved to `output_faces/group_N/<face_id>.jpg`.
+5. **Tag**: normalized bbox + owning group written to `photo_faces` (drives hover tags + photo↔group links).
+6. **Checkpoint**: `processed_files` + `groups` + tags flushed to SQLite every 100 photos / 20 s and at the end.
+
+---
+
+## Output & project structure
+
+```text
+facedeck/
+├── face_grouping_web.py   # Web UI + REST API (recommended entrypoint)
+├── face_grouping_v5.py    # Core engine + CLI (detection, grouping, DB schema)
+├── face_grouping_gui.py   # Tkinter desktop GUI (basic runner/browser)
+├── templates/index.html   # Web UI shell
+├── static/style.css       # Dark/light theme
+├── static/js/             # Web UI logic
+├── tests/test_web_api.py  # API tests
+├── Test/                  # Sample images (git-ignored)
+├── output_faces/          # Cropped faces: group_1/*.jpg … + .trash/ (git-ignored)
+├── processing_state.db    # SQLite state: files, groups, names, tags, dupes, undo (git-ignored)
+└── requirements.txt
+```
+
+- `output_faces/group_N/`: one folder per person, face crops only. `.trash/` holds deleted crops for undo.
+- `processing_state.db`: the source of truth. Groups belong to the **DB, not the folder** — reuse the same DB to keep names/curation; use a fresh DB to start over.
+- Use **Export CSV/JSON** in the web UI for portable reports (the DB is an internal format).
+
+---
+
+## Typical curation workflow
+
+1. Run grouping on your library.
+2. Sort People by **Most photos** → rename the biggest groups first.
+3. Open each person → `View` faces → multi-select outliers → **Move** to the right person (or a new group).
+4. **Delete** non-faces / junk crops (goes to `.trash`, undoable).
+5. Check **Duplicates** → delete true copies (→ OS trash), link/dismiss lookalikes.
+6. **Approve** clean people; **delete** groups only once they're fully empty.
+7. **Export** CSV/JSON for backup or sharing.
+
+---
+
+## Troubleshooting / FAQ
+
+**No faces found?**
+- Check the format list and that `input_folders` point at files, not at the `output_faces` folder.
+- Very small / blurry / profile faces may need a lower threshold or better originals.
+
+**Too many groups (one person split)?** Lower the threshold slightly (e.g. `0.60 → 0.55`) and re-run, then merge leftovers with bulk-move.
+
+**Different people merged?** Raise the threshold (e.g. `0.60 → 0.68`) for the next run, then split with move-to-new-group.
+
+**Model download slow / fails?** First run fetches `buffalo_l` from InsightFace model zoo. Retry with internet on, or pre-download per [InsightFace docs](https://github.com/deepinsight/insightface).
+
+**CUDA not used / falls back to CPU?** Normal without a CUDA setup — processing still works, just slower. Install a CUDA-enabled `onnxruntime-gpu` matching your driver to speed up.
+
+**HEIC won't open?** Ensure `pillow-heif` installed (`pip install -r requirements.txt`). iPhone HEIC + HEIF both supported.
+
+**Boxes misaligned?** Shouldn't happen — orientation is normalized at detection and serving. Photos processed by very old versions (before tagging) show no boxes until reprocessed.
+
+**Old DB / output from before?** Face IDs changed to include a folder hash. Rebuild from scratch: delete (or rename) the old `.db` + `output_faces`, then re-run.
+
+**Locked during run (409 "grouping run in progress")?** Expected — move/delete/approve/undo pause while checkpoints write. Wait for finish/cancel; renaming still works.
+
+**Where is Reveal opening?** On the **server machine** (where `face_grouping_web.py` runs), not on a remote browser — by design for local libraries.
+
+---
+
+## Performance tips
+
+- Start with a **subset folder** to tune threshold, then run the full library.
+- Keep the **summary list** (default) for browsing; only open face grids / thumbnails for the person you're curating.
+- GPU + `det_size=(640,640)` default is a good speed/accuracy trade-off.
+- Thousands of photos are fine — photos list is paginated (`?page=&per_page=&q=`), faces paginated (`?page=&per_page=`).
+
+---
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+Covers the web API (groups, faces/photos pagination, rename, move/delete/undo guards, duplicates, export).
+
+---
+
+## Privacy
+
+100% local. Photos, embeddings, crops, and the database never leave your machine. The only network access is the one-time InsightFace model download (plus Google Fonts in the web UI, which you can remove if fully offline).
+
+---
+
+## License
+
+No license file is shipped with this repo yet. Add one (e.g. MIT) if you plan to share or accept contributions.
