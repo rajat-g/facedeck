@@ -91,7 +91,7 @@ python face_grouping_web.py
 
 ### Export & interfaces
 - Export groups as **CSV or JSON** (group id, name, directory, face + source-photo lists)
-- Three interfaces: **Web UI** (`face_grouping_web.py`, recommended), **CLI** (`face_grouping_v5.py`), **Desktop GUI** (`face_grouping_gui.py`, Tkinter)
+- Two interfaces: **Web UI** (`face_grouping_web.py`, recommended) and **CLI** (`face_grouping_v5.py`, scripting/headless)
 - Cross-platform Reveal: Windows Explorer `/select`, macOS Finder `-R`, Linux `xdg-open` / `gio`
 
 ---
@@ -181,14 +181,6 @@ python face_grouping_v5.py \
 | `--det-thresh` | No | `0.5` | Face *detection* confidence (0.05–0.9). Lower finds more faces but also more false alarms. Different from `--threshold`, which only affects grouping. |
 | `--only-faceless` | No | off | Rescan ONLY processed photos with no detected faces (pairs with `--det-thresh`). Everything else is skipped. |
 
-### C. Desktop GUI (Tkinter)
-
-```bash
-python face_grouping_gui.py
-```
-
-Pick input/output/DB with Browse buttons, drag the threshold slider, `Start grouping`, then browse groups and thumbnails. Renaming is supported; full curation (move/delete/duplicates/tags) lives in the web app.
-
 ---
 
 ## Threshold guide
@@ -225,7 +217,6 @@ You can re-run with a different threshold — only new/changed photos are reproc
 facedeck/
 ├── face_grouping_web.py   # Web UI + REST API (recommended entrypoint)
 ├── face_grouping_v5.py    # Core engine + CLI (detection, grouping, DB schema)
-├── face_grouping_gui.py   # Tkinter desktop GUI (basic runner/browser)
 ├── templates/index.html   # Web UI shell
 ├── static/style.css       # Dark/light theme
 ├── static/js/             # Web UI logic (people, review tabs, duplicates, faceless, viewer)

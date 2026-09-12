@@ -357,7 +357,7 @@ def cosine_similarity(a, b):
 
 
 def open_db(db_path: str) -> sqlite3.Connection:
-    """Open (and initialise) the database. Shared by web UI, GUI and CLI."""
+    """Open (and initialise) the database. Shared by web UI and CLI."""
     return _init_db(db_path)
 
 
