@@ -1957,28 +1957,32 @@ def api_photos_wall():
     people_by_path = {}
     faces_by_path = {}
     unnamed_by_path = {}
+    # Attached rows only: detached faces are hidden in the viewer too, so they
+    # never add faces, unnamed counts or people chips here.
     for r in conn.execute(
-        "SELECT pf.image_path, pf.detached, COALESCE(cf.group_id, pf.group_id) AS gid, "
+        "SELECT pf.image_path, COALESCE(cf.group_id, pf.group_id) AS gid, "
         "g.name, g.directory "
         "FROM photo_faces pf "
         "LEFT JOIN group_cropped_faces cf ON cf.face_id = pf.face_id "
         "LEFT JOIN groups g ON g.id = COALESCE(cf.group_id, pf.group_id) "
-        f"WHERE pf.image_path IN ({bulk})",
+        f"WHERE pf.image_path IN ({bulk}) AND pf.detached=0",
         paths,
     ):
-        if not r["detached"]:
-            faces_by_path[r["image_path"]] = faces_by_path.get(r["image_path"], 0) + 1
-        if r["gid"] is None:
-            if not r["detached"]:
-                unnamed_by_path[r["image_path"]] = unnamed_by_path.get(r["image_path"], 0) + 1
-            continue
-        bucket = people_by_path.setdefault(r["image_path"], {})
-        entry = bucket.setdefault(
-            r["gid"],
-            {"id": r["gid"], "name": r["name"] or Path(r["directory"]).name},
-        )
-        if r["name"] and not entry["name"]:
-            entry["name"] = r["name"]
+        img = r["image_path"]
+        faces_by_path[img] = faces_by_path.get(img, 0) + 1
+        gid = r["gid"]
+        if gid is not None and (r["name"] or r["directory"]):
+            bucket = people_by_path.setdefault(img, {})
+            entry = bucket.setdefault(
+                gid,
+                {"id": gid, "name": r["name"] or Path(r["directory"]).name},
+            )
+            if r["name"] and not entry["name"]:
+                entry["name"] = r["name"]
+        else:
+            # No group yet, or the group row is gone (dangling id with no
+            # name and no directory) — an unnamed face; never Path(None).
+            unnamed_by_path[img] = unnamed_by_path.get(img, 0) + 1
 
     aliases = alias_map_for_photos(conn, paths)
     conn.close()
@@ -2083,7 +2087,15 @@ def _create_group_for_tag(conn, name):
         "VALUES (?, '', 0, ?, ?)",
         (new_id, str(dst_dir), name),
     )
-    return {"id": new_id, "name": name, "directory": str(dst_dir)}
+    return {
+        "id": new_id,
+        "name": name,
+        "directory": str(dst_dir),
+        # Mirror the row just inserted so the fold-in below can treat this
+        # like any other target.
+        "sum_embedding": "",
+        "count": 0,
+    }
 
 
 def _face_embedding_for_tag(face_app, img, bbox_xyxy):
@@ -2112,14 +2124,19 @@ def _crop_from_photo(path, norm_bbox, dst_file):
     """Write a face crop JPG (detection pixel space) for a tagging."""
     img = read_image(path)
     if img is None:
-        return False
+        raise ValueError(f"Could not decode source photo: {path}")
     h, w = img.shape[:2]
     x1 = max(0, min(int(norm_bbox[0] * w), w - 1))
     y1 = max(0, min(int(norm_bbox[1] * h), h - 1))
     x2 = max(x1 + 1, min(int(norm_bbox[2] * w), w))
     y2 = max(y1 + 1, min(int(norm_bbox[3] * h), h))
-    cv2.imwrite(str(dst_file), img[y1:y2, x1:x2])
-    return True
+    ok, buf = cv2.imencode(".jpg", img[y1:y2, x1:x2])
+    if not ok:
+        raise ValueError("Could not encode face crop")
+    # Write via Path.write_bytes instead of cv2.imwrite: imwrite silently
+    # fails on non-ASCII (Unicode) paths on Windows, while Python's file API
+    # handles them fine. The caller turns every failure into a rollback.
+    dst_file.write_bytes(buf.tobytes())
 
 
 @app.route("/api/photos/tag", methods=["POST"])
@@ -2176,7 +2193,9 @@ def api_photos_tag():
             if name_error:
                 return jsonify({"error": name_error}), 400
             target = None
-            for grow in conn.execute("SELECT id, name, directory FROM groups"):
+            for grow in conn.execute(
+                "SELECT id, name, directory, sum_embedding, count FROM groups"
+            ):
                 if _person_matches_name(grow, new_name):
                     target = dict(grow)
                     break
@@ -2250,6 +2269,17 @@ def api_photos_tag():
                 except Exception:
                     traceback.print_exc()
                     conn.rollback()
+                    if created_person:
+                        # `_create_group_for_tag` refuses an existing folder, so
+                        # leaving the just-created folder would permanently
+                        # block retrying this name after a rollback. Remove
+                        # only what this attempt produced (the crop inside a
+                        # folder created here); pre-existing folders stay.
+                        try:
+                            dst_file.unlink(missing_ok=True)
+                            Path(target["directory"]).rmdir()
+                        except OSError:
+                            pass  # folder no longer empty — somebody else's; keep
                     return jsonify({"error": "Could not write face crop"}), 500
             conn.execute(
                 "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) VALUES (?, ?)",
@@ -2273,7 +2303,7 @@ def api_photos_tag():
 
         # Fold the embedding in on a first-ever assignment so future grouping
         # runs treat this as a normal member of the person.
-        if target.get("sum_embedding"):
+        if target.get("sum_embedding") is not None:
             joined_from_nothing = not old_group_ids
             if joined_from_nothing:
                 try:
@@ -2290,11 +2320,18 @@ def api_photos_tag():
                         total = np.fromstring(target["sum_embedding"], sep=",", dtype=np.float32)
                         if total.size:
                             new_sum = total + emb
-                            conn.execute(
-                                "UPDATE groups SET sum_embedding=?, count=? WHERE id=?",
-                                (",".join(f"{v:.8g}" for v in new_sum),
-                                 int(target.get("count") or 0) + 1, target_id),
-                            )
+                            new_count = int(target.get("count") or 0) + 1
+                        else:
+                            # Empty stored sum: this face becomes the person's
+                            # first member (same init the grouping pipeline
+                            # uses when it creates a fresh group).
+                            new_sum = emb
+                            new_count = 1
+                        conn.execute(
+                            "UPDATE groups SET sum_embedding=?, count=? WHERE id=?",
+                            (",".join(f"{v:.8g}" for v in new_sum),
+                             new_count, target_id),
+                        )
                 except Exception:
                     traceback.print_exc()  # tagging itself must not fail on this
 

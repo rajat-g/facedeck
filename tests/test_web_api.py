@@ -1972,6 +1972,37 @@ class PhotoWallTestCase(unittest.TestCase):
         self.assertEqual(photos[self.p3]["unnamed"], 1)
         self.assertEqual(photos[self.d1]["dup_of"], self.p1, "alias flagged")
 
+    def test_wall_ignores_detached_faces_in_summaries(self):
+        conn = self.db_conn()
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (self.p3, 5, "p3_5", 0.1, 0.2, 0.3, 0.4, 1),
+        )
+        conn.commit()
+        conn.close()
+        p3v = self.by_path(self.wall())[self.p3]
+        self.assertEqual(p3v["faces"], 1, "detached face is not counted")
+        self.assertEqual(p3v["unnamed"], 1)
+        self.assertEqual(p3v["people"], [], "detached face never adds a people chip")
+
+    def test_wall_dangling_group_counts_unnamed(self):
+        """A group_id with no groups row must not crash the wall (Path(None))."""
+        conn = self.db_conn()
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (self.d1, 0, "d1_0", 0.1, 0.2, 0.3, 0.4, 77),
+        )
+        conn.commit()
+        conn.close()
+        resp = self.client.get(f"/api/photos?{self.q}")
+        self.assertEqual(resp.status_code, 200)
+        d1v = self.by_path(resp.get_json())[self.d1]
+        self.assertEqual(d1v["faces"], 1)
+        self.assertEqual(d1v["unnamed"], 1, "orphan group id is an unnamed face")
+        self.assertEqual(d1v["people"], [])
+
     def test_wall_pagination(self):
         body = self.wall("&page=2&per_page=2")
         self.assertEqual(body["total"], 4)
@@ -2038,12 +2069,36 @@ class PhotoWallTestCase(unittest.TestCase):
 
     # ---------- tagging (add / change names) ----------
 
+    def _mock_face_app(self, faces=()):
+        """Stand-in for the real InsightFace loader; never load it in tests.
+
+        `faces` is a sequence of (normalised bbox, embedding) pairs, turned
+        into detections scaled to each queried photo's pixel size.
+        """
+        from unittest import mock
+
+        class _Detection:
+            def __init__(self, bbox, embedding):
+                self.bbox = bbox
+                self.embedding = embedding
+
+        class _App:
+            def get(self, img):
+                h, w = img.shape[:2]
+                return [
+                    _Detection([x1 * w, y1 * h, x2 * w, y2 * h], emb)
+                    for x1, y1, x2, y2, emb in faces
+                ]
+
+        return mock.patch("face_grouping_web.get_face_app", return_value=_App())
+
     def test_tag_assign_new_person(self):
-        resp = self.client.post(
-            "/api/photos/tag",
-            json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
-                  "db_file": str(self.db_file)},
-        )
+        with self._mock_face_app():
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertTrue(body["created_person"])
@@ -2076,11 +2131,12 @@ class PhotoWallTestCase(unittest.TestCase):
         self.assertEqual(tags[0]["name"], "Carol")
 
     def test_tag_assign_matches_existing_person_case_insensitive(self):
-        resp = self.client.post(
-            "/api/photos/tag",
-            json={"path": self.p3, "face_idx": 0, "new_name": "  alice ",
-                  "db_file": str(self.db_file)},
-        )
+        with self._mock_face_app():
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "  alice ",
+                      "db_file": str(self.db_file)},
+            )
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertFalse(body["created_person"])
@@ -2090,6 +2146,128 @@ class PhotoWallTestCase(unittest.TestCase):
         n = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
         conn.close()
         self.assertEqual(n, 2, "no new group for an existing name")
+
+    def test_tag_existing_person_folds_embedding_like_group_id_path(self):
+        """Name-matched targets carry the same embedding state as group_id."""
+        conn = self.db_conn()
+        conn.execute(
+            "UPDATE groups SET sum_embedding='0.5,0.5,0.5,0.5', count=2 WHERE id=1"
+        )
+        conn.commit()
+        conn.close()
+        with self._mock_face_app(
+            [(0.2, 0.3, 0.6, 0.7, [1.0, 1.0, 1.0, 1.0])]
+        ):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Alice",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.get_json()["created_person"])
+
+        conn = self.db_conn()
+        row = conn.execute(
+            "SELECT sum_embedding, count FROM groups WHERE id=1"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(
+            [float(v) for v in row["sum_embedding"].split(",")],
+            [1.5, 1.5, 1.5, 1.5], "existing sum plus this face",
+        )
+        self.assertEqual(row["count"], 3)
+
+    def test_tag_new_person_initializes_embedding(self):
+        """First-ever assignment seeds the sum (pipeline's fresh-group init)."""
+        with self._mock_face_app(
+            [(0.2, 0.3, 0.6, 0.7, [1.0, 1.0, 1.0, 1.0])]
+        ):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+
+        conn = self.db_conn()
+        row = conn.execute(
+            "SELECT sum_embedding, count FROM groups WHERE name='Carol'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(
+            [float(v) for v in row["sum_embedding"].split(",")],
+            [1.0, 1.0, 1.0, 1.0], "seeded from the tagged face",
+        )
+        self.assertEqual(row["count"], 1)
+
+    def test_tag_decode_failure_returns_500_and_rolls_back(self):
+        """Unreadable source: no partial tag, no phantom crop, no undo."""
+        Path(self.p3).unlink()
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.get_json()["error"], "Could not write face crop")
+
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM groups WHERE name='Carol'"
+            ).fetchone()[0],
+            0, "new group rolled back",
+        )
+        self.assertIsNone(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+                (self.p3,),
+            ).fetchone()[0], "tag assignment rolled back",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p3_0'"
+            ).fetchone()[0],
+            0, "no crop registry entry for a crop that was never written",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0],
+            0, "no undo registered for a failed tag",
+        )
+        conn.close()
+
+        # The rollback must also not leave the freshly created person folder
+        # on disk: that would block retrying the same name.
+        self.assertFalse(
+            (self.out_root / "Carol").exists(),
+            "failed tag must not leave its just-created folder",
+        )
+        _write_photo(self.photos / "p3.jpg")
+        with self._mock_face_app():
+            retry = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(retry.status_code, 200, "name is retryable again")
+        self.assertTrue((self.out_root / "Carol" / "p3_0.jpg").is_file())
+
+    def test_tag_crop_failure_leaves_preexisting_folders(self):
+        """Cleanup is restricted to folders the failed attempt created."""
+        Path(self.p3).unlink()
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p3, "face_idx": 0, "new_name": "Alice",
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 500)
+        self.assertTrue(self.g1.exists(), "pre-existing person folder untouched")
+        self.assertTrue((self.g1 / "p1_0.jpg").is_file())
+        self.assertTrue((self.g1 / "p2_0.jpg").is_file())
+        conn = self.db_conn()
+        n = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2, "no partial group survived the failure")
 
     def test_tag_change_person_moves_crop_and_undo_restores(self):
         resp = self.client.post(
@@ -2121,11 +2299,12 @@ class PhotoWallTestCase(unittest.TestCase):
         self.assertEqual(gid, 1, "tag reverted to Alice")
 
     def test_tag_undo_new_person_assignment(self):
-        resp = self.client.post(
-            "/api/photos/tag",
-            json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
-                  "db_file": str(self.db_file)},
-        )
+        with self._mock_face_app():
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
         self.assertEqual(resp.status_code, 200)
         undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
         self.assertEqual(undo.status_code, 200)

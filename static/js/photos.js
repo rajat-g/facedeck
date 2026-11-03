@@ -154,10 +154,17 @@ async function loadNext(w) {
     } catch (err) {
         toastError(err.message);
     } finally {
+        const stale = rev !== w.rev; // query raced mid-flight: reply was dropped
         w.loading = false;
         w.grid.classList.remove("wall-loading");
         w.more.classList.toggle("hidden", w.done);
         w.more.disabled = w.loading;
+        if (stale) {
+            // The query changed while this request ran: setSearch reset state
+            // and its own reload was swallowed by `w.loading`, so the current
+            // query would otherwise never be fetched for a lost scroll event.
+            loadNext(w);
+        }
     }
 }
 
@@ -336,6 +343,7 @@ async function loadPhoto(path) {
         toastError(err.message);
     }
     if (!pv || pv.path !== path || !photoViewerIsOpen()) return; // moved on meanwhile
+    hidePvLoading(); // this load owns the spinner; fetch failed or finished
     pv.tags = tags;
     pv.duplicateOf = duplicateOf;
     pv.busy = false;
@@ -565,6 +573,7 @@ function openPopover(tag, facePos, anchorEl) {
 function popItem(text, onClick) {
     const b = document.createElement("button");
     b.type = "button";
+    b.className = "pv-pop-item";
     b.textContent = text;
     if (onClick) {
         b.addEventListener("click", onClick);
