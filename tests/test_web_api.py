@@ -2356,6 +2356,50 @@ class PhotoWallTestCase(unittest.TestCase):
         )
         conn.close()
 
+    def test_tag_restore_failure_preserves_the_moved_crop(self):
+        """A completed move's copy survives a failed restoration (logged)."""
+        from unittest import mock
+
+        real_move = shutil.move
+        calls = {"n": 0}
+
+        def fake_move(src, dst):
+            # First call is the actual crop move; the restore call fails.
+            if calls["n"] == 0:
+                calls["n"] += 1
+                return real_move(src, dst)
+            raise OSError("restore boom")
+
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=OSError("relink boom")), \
+                mock.patch("face_grouping_web.shutil.move",
+                           side_effect=fake_move):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p1, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 400)
+        # Restore failed, but the crop was moved: keep the copy — do NOT
+        # fall through to unlinking the destination.
+        self.assertTrue((self.out_root / "Carol").exists())
+        self.assertTrue(
+            (self.out_root / "Carol" / "p1_0.jpg").is_file(),
+            "completed destination preserved when restore failed",
+        )
+        self.assertFalse((self.g1 / "p1_0.jpg").exists())
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+                (self.p1,),
+            ).fetchone()[0], 1, "assignment rolled back to Alice",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
+        )
+        conn.close()
+
     def test_tag_move_failure_restores_crop_to_source_person(self):
         """Failed move into an existing person: the crop goes back home."""
         from unittest import mock

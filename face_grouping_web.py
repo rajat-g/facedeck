@@ -1420,8 +1420,14 @@ def relink_photo(conn, image_path):
     return True
 
 
-def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
-    """Move one face crop into dst_dir; returns an undo detail dict."""
+def move_single_face(conn, group_id, filename, dst_dir, dst_group_id,
+                     move_state=None):
+    """Move one face crop into dst_dir; returns an undo detail dict.
+
+    `move_state` (optional dict) records "file_moved": True the moment
+    shutil.move returns, letting failure cleanup distinguish a completed
+    relocation from an aborted one.
+    """
     src_row = conn.execute(
         "SELECT directory FROM groups WHERE id=?", (group_id,)
     ).fetchone()
@@ -1437,6 +1443,8 @@ def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
         raise FileExistsError("A file with this name already exists in target")
 
     shutil.move(str(src_path), str(dst_path))
+    if move_state is not None:
+        move_state["file_moved"] = True
     face_id = src_path.stem
     conn.execute(
         "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
@@ -2242,6 +2250,7 @@ def api_photos_tag():
 
         crop_name = f"{face_id}.jpg" if not face_id.lower().endswith(".jpg") else face_id
         undo_item = None
+        move_state = None       # {"file_moved": True} once shutil.move returns
         transfer_from = None  # crop record moved/removed from another person
         if old_crop and target_id != old_crop["group_id"]:
             # A crop exists in another person's folder — do a proper move so
@@ -2259,10 +2268,11 @@ def api_photos_tag():
                 # (restored) registry says it belongs.
                 request_crop_file = Path(target["directory"]) / crop_name
                 request_crop_src = src_file
+                move_state = {"file_moved": False}
                 try:
                     undo_item = move_single_face(
                         conn, old_crop["group_id"], crop_name,
-                        Path(target["directory"]), target_id,
+                        Path(target["directory"]), target_id, move_state,
                     )
                 except OSError as exc:
                     return jsonify({"error": f"Tag change failed: {exc}"}), 400
@@ -2369,7 +2379,14 @@ def api_photos_tag():
                         and not request_crop_src.exists()):
                     shutil.move(str(request_crop_file), str(request_crop_src))
             except OSError:
-                pass
+                traceback.print_exc()  # restoration failed — log, don't hide
+            # A completed move (or a vanished source) leaves the moved copy as
+            # the crop's only copy: keep it when restoration was skipped or
+            # failed. When the move never completed and the source still
+            # holds the crop, keep the unlink-up-the-destination cleanup.
+            if ((move_state is not None and move_state["file_moved"])
+                    or not request_crop_src.exists()):
+                request_crop_file = None
         if request_dir is not None:
             # The transaction never committed: remove only what this request
             # put on disk — its crop and its person folder — so the same name
