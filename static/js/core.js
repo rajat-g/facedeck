@@ -4,6 +4,7 @@ export const PEOPLE_PER_PAGE = 20;
 export const FACES_PER_PAGE = 48;
 export const PHOTOS_PER_PAGE_LIST = 50;
 export const PHOTOS_PER_PAGE_THUMBS = 30;
+export const PHOTOS_PER_PAGE_WALL = 60;
 export const SETTINGS_KEY = "facedeck-settings-v2";
 
 export const state = {
@@ -87,6 +88,11 @@ export function sourceUrl(groupId, path) {
 
 export function facelessUrl(path) {
     return `/api/faceless-image?path=${encodeURIComponent(path)}&db_file=${encodeURIComponent(getDbFile())}`;
+}
+
+/* Disk-cached downscaled photo — cheap for walls with thousands of photos. */
+export function thumbUrl(path, size = 320) {
+    return `/api/thumb?path=${encodeURIComponent(path)}&size=${size}&db_file=${encodeURIComponent(getDbFile())}`;
 }
 
 export function initials(name) {
