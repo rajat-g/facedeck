@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import itertools
 import json
@@ -1419,8 +1420,14 @@ def relink_photo(conn, image_path):
     return True
 
 
-def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
-    """Move one face crop into dst_dir; returns an undo detail dict."""
+def move_single_face(conn, group_id, filename, dst_dir, dst_group_id,
+                     move_state=None):
+    """Move one face crop into dst_dir; returns an undo detail dict.
+
+    `move_state` (optional dict) records "file_moved": True the moment
+    shutil.move returns, letting failure cleanup distinguish a completed
+    relocation from an aborted one.
+    """
     src_row = conn.execute(
         "SELECT directory FROM groups WHERE id=?", (group_id,)
     ).fetchone()
@@ -1436,6 +1443,8 @@ def move_single_face(conn, group_id, filename, dst_dir, dst_group_id):
         raise FileExistsError("A file with this name already exists in target")
 
     shutil.move(str(src_path), str(dst_path))
+    if move_state is not None:
+        move_state["file_moved"] = True
     face_id = src_path.stem
     conn.execute(
         "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
@@ -1509,6 +1518,37 @@ def api_undo():
 
 def undo_item(conn, item):
     """Reverse a single delete/move/group-delete item. Returns a short description."""
+    if "tag_op" in item:
+        # Undo of a photo-wall tagging: restore the face's previous person
+        # (or none), drop the crop this action created/moved and relink the
+        # photo. Embeddings are not reverted — the pipeline doesn't revert
+        # them on move either.
+        face_id = item["face_id"]
+        dst = Path(item["dst_path"])
+        if item.get("created_crop") and dst.exists():
+            trash_dir = dst.parent.parent / ".trash"
+            trash_dir.mkdir(parents=True, exist_ok=True)
+            trash_path = trash_dir / f"{int(time.time() * 1000)}_{next(_trash_seq)}_{dst.name}"
+            try:
+                shutil.move(str(dst), str(trash_path))
+            except OSError:
+                pass
+        conn.execute(
+            "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
+            (item["new_group_id"], face_id),
+        )
+        if item.get("old_crop_group_id") is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) VALUES (?, ?)",
+                (item["old_crop_group_id"], face_id),
+            )
+        conn.execute(
+            "UPDATE photo_faces SET group_id=?, detached=0 WHERE face_id=?",
+            (item.get("old_group_id"), face_id),
+        )
+        for photo in photo_paths_for_face(conn, face_id):
+            relink_photo(conn, photo)
+        return f"reverted tag for {dst.name}"
     if "alias_dup" in item:
         # Undo of a duplicate unlink: re-register the alias.
         conn.execute(
@@ -1845,6 +1885,648 @@ def api_photo_tags():
         )
     return jsonify({"tags": tags,
                     "duplicate_of": tag_source if tag_source != path else None})
+
+
+# ---------- Photo wall (every processed photo, with stored face tags) ----------
+
+_THUMB_SIZES = (240, 320, 480, 800, 1280)
+_THUMB_CACHE_LIMIT = 4000
+_thumb_registry_lock = threading.Lock()
+_thumb_locks = {}
+
+
+def _wall_filter_sql(q_param):
+    """(where, params) for ?q= on the photo wall: filename OR person name."""
+    if not q_param:
+        return "", []
+    like = f"%{_like_escape(q_param)}%"
+    return (
+        "WHERE pf.file_path LIKE ? ESCAPE '\\'"
+        " OR EXISTS ("
+        "  SELECT 1 FROM photo_faces t"
+        "  LEFT JOIN group_cropped_faces tc ON tc.face_id = t.face_id"
+        "  LEFT JOIN groups gg ON gg.id = COALESCE(tc.group_id, t.group_id)"
+        "  WHERE t.image_path = pf.file_path AND t.detached = 0"
+        "  AND (gg.name LIKE ? ESCAPE '\\' OR gg.directory LIKE ? ESCAPE '\\')"
+        ")",
+        [like, like, like],
+    )
+
+
+def _person_matches_name(row, want):
+    """Case-insensitive person match against the name OR folder name."""
+    want = want.casefold()
+    if (row["name"] or "").casefold() == want:
+        return True
+    return Path(row["directory"]).name.casefold() == want
+
+
+@app.route("/api/photos")
+def api_photos_wall():
+    """Paginated wall of every processed photo with its current people.
+
+    One query paginates paths (indexed primary key), a second fetches the tag
+    summary for just that page — the wall stays O(page) instead of O(library).
+    """
+    db_file = request.args.get("db_file", "processing_state.db")
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = int(request.args.get("per_page", 60))
+    except (TypeError, ValueError):
+        per_page = 60
+    per_page = max(1, min(per_page, 200))
+    q = (request.args.get("q") or "").strip()
+
+    if not Path(db_file).exists():
+        return jsonify({"photos": [], "total": 0, "page": page, "per_page": per_page})
+
+    where, wparams = _wall_filter_sql(q)
+    conn = open_db(db_file)
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM processed_files pf {where}", wparams
+    ).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT pf.file_path FROM processed_files pf {where} "
+        "ORDER BY pf.file_path LIMIT ? OFFSET ?",
+        wparams + [per_page, (page - 1) * per_page],
+    ).fetchall()
+    paths = [r[0] for r in rows]
+    if not paths:
+        conn.close()
+        return jsonify(
+            {"photos": [], "total": total, "page": page, "per_page": per_page}
+        )
+
+    # Tag summary for this page only (photo_faces is indexed on image_path).
+    bulk = ",".join("?" * len(paths))
+    people_by_path = {}
+    faces_by_path = {}
+    unnamed_by_path = {}
+    # Attached rows only: detached faces are hidden in the viewer too, so they
+    # never add faces, unnamed counts or people chips here.
+    for r in conn.execute(
+        "SELECT pf.image_path, COALESCE(cf.group_id, pf.group_id) AS gid, "
+        "g.name, g.directory "
+        "FROM photo_faces pf "
+        "LEFT JOIN group_cropped_faces cf ON cf.face_id = pf.face_id "
+        "LEFT JOIN groups g ON g.id = COALESCE(cf.group_id, pf.group_id) "
+        f"WHERE pf.image_path IN ({bulk}) AND pf.detached=0",
+        paths,
+    ):
+        img = r["image_path"]
+        faces_by_path[img] = faces_by_path.get(img, 0) + 1
+        gid = r["gid"]
+        if gid is not None and (r["name"] or r["directory"]):
+            bucket = people_by_path.setdefault(img, {})
+            entry = bucket.setdefault(
+                gid,
+                {"id": gid, "name": r["name"] or Path(r["directory"]).name},
+            )
+            if r["name"] and not entry["name"]:
+                entry["name"] = r["name"]
+        else:
+            # No group yet, or the group row is gone (dangling id with no
+            # name and no directory) — an unnamed face; never Path(None).
+            unnamed_by_path[img] = unnamed_by_path.get(img, 0) + 1
+
+    aliases = alias_map_for_photos(conn, paths)
+    conn.close()
+    photos = []
+    for p in paths:
+        bucket = people_by_path.get(p, {})
+        people = [bucket[gid] for gid in bucket]
+        people.sort(key=lambda x: (x["name"] or "").casefold())
+        photos.append(
+            {
+                "path": p,
+                "faces": faces_by_path.get(p, 0),
+                "people": people,
+                "unnamed": unnamed_by_path.get(p, 0),
+                "dup_of": aliases.get(p),
+            }
+        )
+    return jsonify(
+        {"photos": photos, "total": total, "page": page, "per_page": per_page}
+    )
+
+
+@app.route("/api/photos/tags")
+def api_photos_tags_any():
+    """Face tags for any processed photo — not group-scoped.
+
+    Same shape as /api/photo-tags; the guard is membership in
+    processed_files so the photo wall can open every processed photo,
+    including one_linked to no group at all (yet).
+    """
+    db_file = request.args.get("db_file", "processing_state.db")
+    path = (request.args.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "Missing path"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+
+    conn = open_db(db_file)
+    known = conn.execute(
+        "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
+    ).fetchone()
+    if known is None:
+        conn.close()
+        return jsonify({"error": "Photo is not in the processed database"}), 404
+
+    tag_source = canonical_for_tag(conn, path)
+    rows = conn.execute(
+        "SELECT pf.face_idx, pf.face_id, pf.x1, pf.y1, pf.x2, pf.y2, "
+        "COALESCE(cf.group_id, pf.group_id) AS group_id, g.name, g.directory, "
+        "EXISTS(SELECT 1 FROM group_cropped_faces c2 "
+        "        WHERE c2.face_id = pf.face_id) AS has_crop "
+        "FROM photo_faces pf "
+        "LEFT JOIN group_cropped_faces cf ON cf.face_id = pf.face_id "
+        "LEFT JOIN groups g ON g.id = COALESCE(cf.group_id, pf.group_id) "
+        "WHERE pf.image_path=? AND pf.detached=0 "
+        "ORDER BY pf.face_idx",
+        (tag_source,),
+    ).fetchall()
+    conn.close()
+
+    tags = []
+    for r in rows:
+        if r["directory"]:
+            name = r["name"] or Path(r["directory"]).name
+        else:
+            name = r["name"] or "Unknown"
+        tags.append(
+            {
+                "face_idx": r["face_idx"],
+                "face_id": r["face_id"],
+                "bbox": [r["x1"], r["y1"], r["x2"], r["y2"]],
+                "group_id": r["group_id"],
+                "name": name if r["group_id"] is not None else None,
+                "has_crop": bool(r["has_crop"]),
+            }
+        )
+    return jsonify({"tags": tags,
+                    "duplicate_of": tag_source if tag_source != path else None})
+
+
+def _create_group_for_tag(conn, name):
+    """Create a new person row+folder for a photo-viewer tagging.
+
+    Mirrors bulk-move's creation rules: folder named after the person inside
+    the library's (most common) group parent.
+    """
+    parents = {}
+    for (directory,) in conn.execute("SELECT directory FROM groups"):
+        parent = str(Path(directory).parent)
+        parents[parent] = parents.get(parent, 0) + 1
+    if parents:
+        parent = Path(max(parents, key=parents.get))
+    else:
+        parent = Path("output_faces")
+    dst_dir = parent / name
+    if dst_dir.exists():
+        raise FileExistsError("A folder with this name already exists")
+    new_id = next_group_id(conn)
+    # Row first, folder last: if id allocation or the insert fails, nothing
+    # was created on disk; a late mkdir failure merely discards the
+    # uncommitted row when its connection closes.
+    conn.execute(
+        "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+        "VALUES (?, '', 0, ?, ?)",
+        (new_id, str(dst_dir), name),
+    )
+    dst_dir.mkdir(parents=True)
+    return {
+        "id": new_id,
+        "name": name,
+        "directory": str(dst_dir),
+        # Mirror the row just inserted so the fold-in below can treat this
+        # like any other target.
+        "sum_embedding": "",
+        "count": 0,
+    }
+
+
+def _face_embedding_for_tag(face_app, img, bbox_xyxy):
+    """Embedding of the detected face overlapping bbox_xyxy (IoU > 0.5)."""
+    detections = face_app.get(img)
+    best, best_iou = None, 0.0
+    for face in detections:
+        db = face.bbox
+        ix1 = max(db[0], bbox_xyxy[0]); iy1 = max(db[1], bbox_xyxy[1])
+        ix2 = min(db[2], bbox_xyxy[2]); iy2 = min(db[3], bbox_xyxy[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            continue
+        a = (db[2] - db[0]) * (db[3] - db[1])
+        b = (bbox_xyxy[2] - bbox_xyxy[0]) * (bbox_xyxy[3] - bbox_xyxy[1])
+        iou = inter / max(a + b - inter, 1e-6)
+        if iou > best_iou:
+            best, best_iou = face, iou
+    if best is None or best_iou <= 0.5:
+        return None
+    return best.embedding
+
+
+def _crop_from_photo(path, norm_bbox, dst_file):
+    """Write a face crop JPG (detection pixel space) for a tagging."""
+    img = read_image(path)
+    if img is None:
+        raise ValueError(f"Could not decode source photo: {path}")
+    h, w = img.shape[:2]
+    x1 = max(0, min(int(norm_bbox[0] * w), w - 1))
+    y1 = max(0, min(int(norm_bbox[1] * h), h - 1))
+    x2 = max(x1 + 1, min(int(norm_bbox[2] * w), w))
+    y2 = max(y1 + 1, min(int(norm_bbox[3] * h), h))
+    ok, buf = cv2.imencode(".jpg", img[y1:y2, x1:x2])
+    if not ok:
+        raise ValueError("Could not encode face crop")
+    # Write via Path.write_bytes instead of cv2.imwrite: imwrite silently
+    # fails on non-ASCII (Unicode) paths on Windows, while Python's file API
+    # handles them fine. The caller turns every failure into a rollback.
+    dst_file.write_bytes(buf.tobytes())
+
+
+@app.route("/api/photos/tag", methods=["POST"])
+def api_photos_tag():
+    """Facebook-style naming from the photo wall: assign/change a face's person.
+
+    Whole-photo view tagging keeps the data model in sync: the crop joins the
+    person's folder, the photo relinks to groups via its live tags, and a
+    first-ever assignment folds the face embedding into the person (the same
+    thing the grouping pipeline does when a face joins).
+    """
+    busy = _require_idle()
+    if busy:
+        return busy
+    data = request.get_json(force=True)
+    db_file = _db_file_from_request(data)
+    path = (data.get("path") or "").strip()
+    try:
+        face_idx = int(data.get("face_idx"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid face index"}), 400
+    group_id = data.get("group_id")
+    new_name = (data.get("new_name") or "").strip()
+    if not path:
+        return jsonify({"error": "Missing path"}), 400
+    if (group_id is None) == (new_name == ""):
+        return jsonify({"error": "Provide either group_id or new_name"}), 400
+
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    conn = open_db(db_file)
+    # On-disk artifacts this request itself created. Removed in the finally
+    # unless the transaction committed, so a failed tagging can be retried;
+    # pre-existing folders are never touched.
+    request_dir = None        # person folder created by this request
+    request_crop_file = None  # crop file this request placed in that folder
+    request_crop_src = None   # where a request-moved crop came from
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        known = conn.execute(
+            "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
+        ).fetchone()
+        if known is None:
+            return jsonify({"error": "Photo is not in the processed database"}), 404
+        tag_source = canonical_for_tag(conn, path)
+
+        row = conn.execute(
+            "SELECT face_id, group_id, x1, y1, x2, y2 FROM photo_faces "
+            "WHERE image_path=? AND face_idx=? AND detached=0",
+            (tag_source, face_idx),
+        ).fetchone()
+        if row is None:
+            return jsonify(
+                {"error": "Face not found on this photo (re-run grouping to add tags)"}
+            ), 404
+        face_id = row["face_id"]
+
+        created_person = False
+        if new_name:
+            name_error = _group_name_error(new_name)
+            if name_error:
+                return jsonify({"error": name_error}), 400
+            target = None
+            for grow in conn.execute(
+                "SELECT id, name, directory, sum_embedding, count FROM groups"
+            ):
+                if _person_matches_name(grow, new_name):
+                    target = dict(grow)
+                    break
+            if target is None:
+                try:
+                    target = _create_group_for_tag(conn, new_name)
+                except FileExistsError as exc:
+                    return jsonify({"error": str(exc)}), 400
+                created_person = True
+                request_dir = Path(target["directory"])
+        else:
+            grow = conn.execute(
+                "SELECT id, name, directory, sum_embedding, count FROM groups WHERE id=?",
+                (int(group_id),),
+            ).fetchone()
+            if grow is None:
+                return jsonify({"error": "Person not found"}), 400
+            target = dict(grow)
+
+        target_id = int(target["id"])
+        old_crop = conn.execute(
+            "SELECT group_id FROM group_cropped_faces WHERE face_id=? LIMIT 1",
+            (face_id,),
+        ).fetchone()
+        old_group_ids = {
+            g for g in (row["group_id"], old_crop["group_id"] if old_crop else None)
+            if g is not None
+        }
+        if target_id in old_group_ids:
+            conn.commit()
+            return jsonify(
+                {"ok": True, "group": {"id": target_id, "name": target["name"]},
+                 "created_person": created_person, "unchanged": True}
+            )
+
+        crop_name = f"{face_id}.jpg" if not face_id.lower().endswith(".jpg") else face_id
+        undo_item = None
+        move_state = None       # {"file_moved": True} once shutil.move returns
+        transfer_from = None  # crop record moved/removed from another person
+        if old_crop and target_id != old_crop["group_id"]:
+            # A crop exists in another person's folder — do a proper move so
+            # the file, crop registry and photo links all follow.
+            src_row = conn.execute(
+                "SELECT directory FROM groups WHERE id=?", (old_crop["group_id"],)
+            ).fetchone()
+            src_file = Path(src_row["directory"]) / crop_name
+            if src_file.exists():
+                # Track the destination before moving: if move_single_face
+                # fails at any internal point (the file itself is part of
+                # that move), the finally cleanup must still find it — an
+                # absent file just makes unlink a no-op. Remember the source
+                # too, so a failed request can put the crop back where the
+                # (restored) registry says it belongs.
+                request_crop_file = Path(target["directory"]) / crop_name
+                request_crop_src = src_file
+                move_state = {"file_moved": False}
+                try:
+                    undo_item = move_single_face(
+                        conn, old_crop["group_id"], crop_name,
+                        Path(target["directory"]), target_id, move_state,
+                    )
+                except OSError as exc:
+                    return jsonify({"error": f"Tag change failed: {exc}"}), 400
+            else:
+                # Stale record (crop deleted by approve etc.): drop it so the
+                # crop registry keeps pointing at one person only.
+                conn.execute(
+                    "DELETE FROM group_cropped_faces WHERE group_id=? AND face_id=?",
+                    (old_crop["group_id"], face_id),
+                )
+                transfer_from = old_crop["group_id"]
+            old_crop = None  # old side handled; fall through to register/create
+        if undo_item is None:
+            dst_file = Path(target["directory"]) / crop_name
+            created_crop = False
+            if not dst_file.exists():
+                # Track before writing: a mid-write failure can leave a
+                # partial file behind that the finally cleanup must remove.
+                if request_dir is not None:
+                    request_crop_file = dst_file
+                try:
+                    _crop_from_photo(
+                        tag_source, [row["x1"], row["y1"], row["x2"], row["y2"]], dst_file
+                    )
+                    created_crop = True
+                except Exception:
+                    traceback.print_exc()
+                    conn.rollback()
+                    return jsonify({"error": "Could not write face crop"}), 500
+            conn.execute(
+                "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) VALUES (?, ?)",
+                (target_id, face_id),
+            )
+            conn.execute(
+                "UPDATE photo_faces SET group_id=?, detached=0 WHERE face_id=?",
+                (target_id, face_id),
+            )
+            # Recompute the photo's links purely from its live faces.
+            relink_photo(conn, tag_source)
+            undo_item = {
+                "tag_op": True,
+                "face_id": face_id,
+                "old_group_id": row["group_id"],
+                "new_group_id": target_id,
+                "dst_path": str(dst_file),
+                "created_crop": created_crop,
+                "old_crop_group_id": transfer_from,
+            }
+
+        # Fold the embedding in on a first-ever assignment so future grouping
+        # runs treat this as a normal member of the person.
+        if target.get("sum_embedding") is not None:
+            joined_from_nothing = not old_group_ids
+            if joined_from_nothing:
+                try:
+                    face_app = get_face_app()
+                    img = read_image(tag_source)
+                    if img is None:
+                        raise ValueError("unreadable")
+                    h, w = img.shape[:2]
+                    emb = _face_embedding_for_tag(
+                        face_app, img,
+                        [row["x1"] * w, row["y1"] * h, row["x2"] * w, row["y2"] * h],
+                    )
+                    if emb is not None:
+                        total = np.fromstring(target["sum_embedding"], sep=",", dtype=np.float32)
+                        if total.size:
+                            new_sum = total + emb
+                            new_count = int(target.get("count") or 0) + 1
+                        else:
+                            # Empty stored sum: this face becomes the person's
+                            # first member (same init the grouping pipeline
+                            # uses when it creates a fresh group).
+                            new_sum = emb
+                            new_count = 1
+                        conn.execute(
+                            "UPDATE groups SET sum_embedding=?, count=? WHERE id=?",
+                            (",".join(f"{v:.8g}" for v in new_sum),
+                             new_count, target_id),
+                        )
+                except Exception:
+                    traceback.print_exc()  # tagging itself must not fail on this
+
+        record_undo(conn, "tag", [undo_item])
+        conn.commit()
+        request_dir = None  # committed — keep the person folder and its crop
+        request_crop_file = None
+        request_crop_src = None
+        return jsonify(
+            {"ok": True,
+             "group": {"id": target_id, "name": target["name"] or Path(target["directory"]).name},
+             "created_person": created_person}
+        )
+    finally:
+        if request_crop_src is not None:
+            # A move may have taken the crop out of its person's folder. When
+            # the transaction never committed, put it back so the registry
+            # (restored by the rollback) stays truthful — even when no fresh
+            # folder was created. Skip when the file never left or its source
+            # slot was refilled meanwhile; keep disk state rather than risk
+            # overwriting something.
+            try:
+                if (request_crop_file is not None and request_crop_file.exists()
+                        and not request_crop_src.exists()):
+                    shutil.move(str(request_crop_file), str(request_crop_src))
+            except OSError:
+                traceback.print_exc()  # restoration failed — log, don't hide
+            # A completed move (or a vanished source) leaves the moved copy as
+            # the crop's only copy: keep it when restoration was skipped or
+            # failed. When the move never completed and the source still
+            # holds the crop, keep the unlink-up-the-destination cleanup.
+            if ((move_state is not None and move_state["file_moved"])
+                    or not request_crop_src.exists()):
+                request_crop_file = None
+        if request_dir is not None:
+            # The transaction never committed: remove only what this request
+            # put on disk — its crop and its person folder — so the same name
+            # stays retryable (`_create_group_for_tag` refuses an existing
+            # folder). A restored crop is already gone from here (unlink is a
+            # no-op), and untracked content remains: rmdir only succeeds on
+            # an emptied folder, leaving anything else untouched.
+            try:
+                if request_crop_file is not None:
+                    request_crop_file.unlink(missing_ok=True)
+                request_dir.rmdir()
+            except OSError:
+                pass  # gained foreign content — not solely ours; keep
+        conn.close()
+
+
+# ---------- Cached thumbnails (photo wall & viewer) ----------
+
+def _thumb_cache_dir(db_file):
+    """Per-library cache next to the database file."""
+    return Path(db_file).resolve().parent / ".thumbnail_cache"
+
+
+def _thumb_key(src_path, stat, size):
+    """Stable cache filename: changes when the photo changes on disk."""
+    digest = hashlib.sha1(
+        f"{src_path}|{stat.st_mtime}|{stat.st_size}|{size}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{digest}_{size}.jpg"
+
+
+def _maybe_sweep(cache_dir):
+    """Bound the cache: drop the oldest thumbs once it grows too big."""
+    try:
+        entries = list(cache_dir.glob("*.jpg"))
+        if len(entries) <= _THUMB_CACHE_LIMIT:
+            return
+        entries.sort(key=lambda p: p.stat().st_mtime)
+        for p in entries[: len(entries) - _THUMB_CACHE_LIMIT]:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _generate_thumbnail(src, size, dst):
+    """Decode, orient and downscale one photo into dst (JPEG)."""
+    from PIL import Image, ImageOps
+
+    src_l = str(src).lower()
+    if src_l.endswith((".heic", ".heif")):
+        arr = read_image(str(src))
+        if arr is None:
+            raise ValueError("Could not decode HEIC image")
+        h, w = arr.shape[:2]
+        scale = min(1.0, size / max(h, w))
+        if scale < 1.0:
+            arr = cv2.resize(arr, (max(1, int(w * scale)), max(1, int(h * scale))),
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if not ok:
+            raise ValueError("HEIC conversion failed")
+        dst.write_bytes(buf.tobytes())
+        return
+    with Image.open(str(src)) as pil:
+        try:
+            orientation = (pil.getexif().get(0x0112) or 1)
+        except Exception:
+            orientation = 1
+        if orientation != 1:
+            pil = ImageOps.exif_transpose(pil)
+        pil = pil.convert("RGB")
+        pil.thumbnail((size, size), Image.LANCZOS)
+        img = pil.copy()
+    tmp = dst.with_name(dst.name + ".part")
+    img.save(tmp, "JPEG", quality=82, progressive=True)
+    os.replace(tmp, dst)
+
+
+@app.route("/api/thumb")
+def api_thumb():
+    """Cached downscaled JPEG for any processed photo (jpegs stay fast).
+
+    Thumbs are generated on first request, cached under .thumbnail_cache
+    beside the database, keyed by path+mtime+size so edits invalidate.
+    """
+    db_file = request.args.get("db_file", "processing_state.db")
+    path = (request.args.get("path") or "").strip()
+    try:
+        size = int(request.args.get("size", 320))
+    except (TypeError, ValueError):
+        size = 320
+    size = min(_THUMB_SIZES[-1], max(_THUMB_SIZES[0], size))
+
+    if not path:
+        return jsonify({"error": "Missing path"}), 400
+    if not Path(db_file).exists():
+        return jsonify({"error": "Database file does not exist"}), 404
+    src = Path(path)
+    if not src.is_file():
+        return jsonify({"error": "Photo file does not exist on server"}), 404
+
+    conn = open_db(db_file)
+    known = conn.execute(
+        "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
+    ).fetchone()
+    conn.close()
+    if known is None:
+        return jsonify({"error": "Photo is not in the processed database"}), 404
+
+    cache_dir = _thumb_cache_dir(db_file)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return jsonify({"error": f"Cannot create thumbnail cache: {exc}"}), 500
+    stat = src.stat()
+    cache_file = cache_dir / _thumb_key(path, stat, size)
+    if cache_file.is_file() and cache_file.stat().st_size > 0:
+        return send_file(cache_file, mimetype="image/jpeg", as_attachment=False,
+                         max_age=86400)
+
+    with _thumb_registry_lock:
+        lock = _thumb_locks.setdefault(str(cache_file), threading.Lock())
+    with lock:
+        if cache_file.is_file() and cache_file.stat().st_size > 0:
+            return send_file(cache_file, mimetype="image/jpeg", as_attachment=False,
+                             max_age=86400)
+        try:
+            _generate_thumbnail(src, size, cache_file)
+        except Exception as exc:
+            cache_file.unlink(missing_ok=True)
+            try:
+                cache_file.with_name(cache_file.name + ".part").unlink(missing_ok=True)
+            except OSError:
+                pass
+            traceback.print_exc()
+            return jsonify({"error": f"Could not create thumbnail: {exc}"}), 500
+        _maybe_sweep(cache_dir)
+    return send_file(cache_file, mimetype="image/jpeg", as_attachment=False,
+                     max_age=86400)
 
 
 # ---------- Faceless photos (processed, but no face detected) ----------
@@ -2479,8 +3161,13 @@ def api_reveal():
     if not Path(db_file).exists():
         return jsonify({"error": "Database file does not exist"}), 404
     conn = open_db(db_file)
-    allowed = (group_id is not None and photo_in_group(conn, group_id, path)) \
+    allowed = (
+        conn.execute(
+            "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
+        ).fetchone() is not None  # photo wall: any processed photo
+        or (group_id is not None and photo_in_group(conn, group_id, path))
         or path in faceless_photos(conn)
+    )
     conn.close()
     if not allowed:
         return jsonify({"error": "Image not associated with this group"}), 404

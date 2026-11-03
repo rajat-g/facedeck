@@ -58,7 +58,10 @@ python face_grouping_web.py
 - Cancel button saves progress so far
 
 ### Review UI (web, recommended)
-- Three tabs keep things uncluttered: **People** (browse + curate), **Review** (duplicates + no-faces, with a count badge so open items don't get ignored), and **Search** (search by example); tab choice is remembered and hash-routed (`#/people`, `#/review`, `#/search`)
+- Five tabs keep things uncluttered: **People** (browse + curate), **Photos** (every processed photo in one wall), **Search** (search photos by filename or person), **Example** (search by example), and **Review** (duplicates + no-faces, with a count badge so open items don't get ignored); tab choice is remembered and hash-routed (`#/people`, `#/photos`, `#/find`, `#/search`, `#/review`)
+- **Photos wall**: ALL processed photos on one page — no face crops anywhere — in a dense thumbnail grid. Click a photo to open the **tag viewer**: a box around every detected face with its name underneath; click a box to **add a name** (pick an existing person or create a new one) or **change the person** — Facebook-style tagging. Boxes are editable for unnamed faces too
+- Photo pages are built for **large libraries**: server-cached, disk-backed thumbnails (a photo is decoded and downscaled once, then served from its own cache file keyed by content), paged fetches with incremental "load more", lazy-loaded images and pre-fetch of neighbouring photos in the viewer. Original files are never repeatedly re-read
+- **Search photos** tab: query by **photo file name or person name** (tagged names included), same fast wall of results with the same tag viewer
 - **Search by example** tab: drop in any photo — or capture one with your camera (device picker, live preview; works on localhost/HTTPS) — every detected face is ranked against all people with similarity scores and a would-join/below-threshold hint; click a match to jump to that person. Read-only: nothing is stored, grouped or trashed
 - Fast **People list** — no images loaded up front, safe for thousands of photos
 - Search by name, filter **All / Pending / Approved**, min-photos filter, sort (Default, Name A–Z, Most/Fewest photos, Newest), pagination
@@ -81,7 +84,8 @@ python face_grouping_web.py
 - **Delete empty groups only** (no faces, no photos) from the detail panel, with undo
 - **Undo** last move / delete / ungroup / group-delete (50 entries kept)
 - Curation **pauses during a run** (409 + visual lock) so checkpoints can't clobber edits; renames stay allowed
-- **Keyboard shortcuts**: arrows navigate faces, `Enter` opens lightbox, `M` moves, `Delete` removes, `Esc` closes dialogs
+- Naming from the photo wall keeps the pipeline data model intact: the face crop is written into the person's folder, the source photo relinks to its live faces, and a first-ever assignment folds the face's embedding into the person (so future runs recognise it). All tags are undoable
+- **Keyboard shortcuts**: arrows navigate faces, `Enter` opens lightbox, `M` moves, `Delete` removes, `Esc` closes dialogs (photo wall viewer: `←`/`→` step between photos, `Esc` closes)
 
 ### Duplicates
 - **Exact duplicates** (SHA-256 content hash) auto-detected, **linked not rescanned**, shown in the same groups automatically

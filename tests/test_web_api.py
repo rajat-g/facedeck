@@ -1864,6 +1864,689 @@ class SearchTestCase(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
 
+def _write_photo(path: Path, w=64, h=40):
+    """Tiny real JPEG so thumbnails / crops can decode it."""
+    import cv2
+
+    import numpy as np
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[: h // 2, w // 2 :, 2] = 220
+    ok, buf = cv2.imencode(".jpg", img)
+    assert ok
+    path.write_bytes(buf.tobytes())
+
+
+class PhotoWallTestCase(unittest.TestCase):
+    """Photo wall, cached thumbnails and wall tagging (add/change names)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="facedeck-wall-"))
+        self.db_file = self.tmp / "state.db"
+        self.out_root = self.tmp / "output_faces"
+        self.photos = self.tmp / "photos"
+        self.photos.mkdir(parents=True)
+
+        self.g1 = self.out_root / "group_1"
+        self.g2 = self.out_root / "group_2"
+        self.g1.mkdir(parents=True)
+        self.g2.mkdir(parents=True)
+
+        make_face_file(self.g1, "p1_0.jpg")
+        make_face_file(self.g2, "p1_1.jpg")
+        make_face_file(self.g1, "p2_0.jpg")
+
+        for n in ("p1.jpg", "p2.jpg", "p3.jpg", "d1.jpg"):
+            _write_photo(self.photos / n)
+        self.p1 = str(self.photos / "p1.jpg")
+        self.p2 = str(self.photos / "p2.jpg")
+        self.p3 = str(self.photos / "p3.jpg")
+        self.d1 = str(self.photos / "d1.jpg")
+
+        conn = open_db(str(self.db_file))
+        conn.executemany(
+            "INSERT INTO groups(id, sum_embedding, count, directory, name) "
+            "VALUES (?, '', 1, ?, ?)",
+            [(1, str(self.g1), "Alice"), (2, str(self.g2), "Bob")],
+        )
+        conn.executemany(
+            "INSERT INTO group_cropped_faces VALUES (?, ?)",
+            [(1, "p1_0"), (2, "p1_1"), (1, "p2_0")],
+        )
+        conn.executemany(
+            "INSERT INTO processed_files(file_path, mtime, size) VALUES (?, ?, ?)",
+            [(p, time.time(), Path(p).stat().st_size)
+             for p in (self.p1, self.p2, self.p3, self.d1)],
+        )
+        conn.executemany(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            [
+                (self.p1, 0, "p1_0", 0.1, 0.1, 0.3, 0.4, 1),
+                (self.p1, 1, "p1_1", 0.4, 0.2, 0.6, 0.5, 2),
+                (self.p1, 2, "p1_2", 0.7, 0.1, 0.9, 0.4, 1),
+                (self.p2, 0, "p2_0", 0.2, 0.2, 0.5, 0.6, 1),
+                # p3 has one face not associated with any person yet.
+                (self.p3, 0, "p3_0", 0.2, 0.3, 0.6, 0.7, None),
+            ],
+        )
+        conn.execute("INSERT INTO group_image_paths VALUES (1, ?)", (self.p1,))
+        conn.execute("INSERT INTO group_image_paths VALUES (1, ?)", (self.p2,))
+        conn.execute("INSERT INTO group_image_paths VALUES (2, ?)", (self.p1,))
+        conn.execute(
+            "INSERT INTO duplicates(dup_path, canonical_path) VALUES (?, ?)",
+            (self.d1, self.p1),
+        )
+        conn.commit()
+        conn.close()
+
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.q = f"db_file={self.db_file.as_posix()}"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def db_conn(self):
+        return open_db(str(self.db_file))
+
+    def wall(self, qs=""):
+        return self.client.get(f"/api/photos?{self.q}{qs}").get_json()
+
+    def by_path(self, body):
+        return {p["path"]: p for p in body["photos"]}
+
+    # ---------- wall listing ----------
+
+    def test_wall_lists_every_processed_photo(self):
+        body = self.wall()
+        self.assertEqual(body["total"], 4)
+        photos = self.by_path(body)
+        self.assertEqual(len(photos), 4)
+        p1v = photos[self.p1]
+        self.assertEqual(p1v["faces"], 3)
+        self.assertEqual(
+            sorted((p["id"], p["name"]) for p in p1v["people"]),
+            [(1, "Alice"), (2, "Bob")],
+        )
+        self.assertEqual(photos[self.p3]["people"], [], "p3 has no person yet")
+        self.assertEqual(photos[self.p3]["unnamed"], 1)
+        self.assertEqual(photos[self.d1]["dup_of"], self.p1, "alias flagged")
+
+    def test_wall_ignores_detached_faces_in_summaries(self):
+        conn = self.db_conn()
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (self.p3, 5, "p3_5", 0.1, 0.2, 0.3, 0.4, 1),
+        )
+        conn.commit()
+        conn.close()
+        p3v = self.by_path(self.wall())[self.p3]
+        self.assertEqual(p3v["faces"], 1, "detached face is not counted")
+        self.assertEqual(p3v["unnamed"], 1)
+        self.assertEqual(p3v["people"], [], "detached face never adds a people chip")
+
+    def test_wall_dangling_group_counts_unnamed(self):
+        """A group_id with no groups row must not crash the wall (Path(None))."""
+        conn = self.db_conn()
+        conn.execute(
+            "INSERT INTO photo_faces(image_path, face_idx, face_id, x1, y1, x2, y2, group_id, detached) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (self.d1, 0, "d1_0", 0.1, 0.2, 0.3, 0.4, 77),
+        )
+        conn.commit()
+        conn.close()
+        resp = self.client.get(f"/api/photos?{self.q}")
+        self.assertEqual(resp.status_code, 200)
+        d1v = self.by_path(resp.get_json())[self.d1]
+        self.assertEqual(d1v["faces"], 1)
+        self.assertEqual(d1v["unnamed"], 1, "orphan group id is an unnamed face")
+        self.assertEqual(d1v["people"], [])
+
+    def test_wall_pagination(self):
+        body = self.wall("&page=2&per_page=2")
+        self.assertEqual(body["total"], 4)
+        self.assertEqual(len(body["photos"]), 2)
+        self.assertEqual(body["page"], 2)
+
+    def test_wall_search_by_filename_and_person(self):
+        self.assertEqual(len(self.wall("&q=p2.jpg")["photos"]), 1, "filename match")
+        paths = {p["path"] for p in self.wall("&q=Alice")["photos"]}
+        self.assertEqual(paths, {self.p1, self.p2}, "person-name match")
+        self.assertEqual(
+            len(self.wall("&q=Bob")["photos"]), 1, "only Bob's photo"
+        )
+        self.assertEqual(len(self.wall("&q=zzz-nothing")["photos"]), 0)
+
+    # ---------- tags for any processed photo ----------
+
+    def test_photos_tags_serve_any_processed_photo(self):
+        resp = self.client.get(
+            f"/api/photos/tags?{self.q}&path={self.p3}"
+        )
+        self.assertEqual(resp.status_code, 200)
+        tags = resp.get_json()["tags"]
+        self.assertEqual(len(tags), 1)
+        self.assertIsNone(tags[0]["name"], "unnamed face")
+        self.assertEqual(tags[0]["face_id"], "p3_0")
+
+    def test_photos_tags_alias_resolves_to_canonical(self):
+        resp = self.client.get(f"/api/photos/tags?{self.q}&path={self.d1}")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["duplicate_of"], self.p1)
+        self.assertEqual([t["face_id"] for t in data["tags"]], ["p1_0", "p1_1", "p1_2"])
+
+    def test_photos_tags_reject_unprocessed_path(self):
+        resp = self.client.get(f"/api/photos/tags?{self.q}&path=C:/Windows/win.ini")
+        self.assertEqual(resp.status_code, 404)
+
+    # ---------- thumbnails ----------
+
+    def test_thumb_generates_then_caches(self):
+        resp = self.client.get(f"/api/thumb?{self.q}&path={self.p1}&size=320")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "image/jpeg")
+        self.assertGreater(len(resp.get_data()), 0)
+        cache_dir = self.tmp / ".thumbnail_cache"
+        self.assertTrue(cache_dir.is_dir())
+        self.assertEqual(len(list(cache_dir.glob("*.jpg"))), 1)
+
+        resp2 = self.client.get(f"/api/thumb?{self.q}&path={self.p1}&size=320")
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(len(list(cache_dir.glob("*.jpg"))), 1, "cache hit")
+
+    def test_thumb_rejects_unprocessed_path(self):
+        resp = self.client.get(f"/api/thumb?{self.q}&path=C:/Windows/win.ini")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_thumb_missing_db_is_404(self):
+        ghost = self.tmp / "ghost.db"
+        resp = self.client.get(
+            f"/api/thumb?db_file={ghost.as_posix()}&path={self.p1}"
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ---------- tagging (add / change names) ----------
+
+    def _mock_face_app(self, faces=()):
+        """Stand-in for the real InsightFace loader; never load it in tests.
+
+        `faces` is a sequence of (normalised bbox, embedding) pairs, turned
+        into detections scaled to each queried photo's pixel size.
+        """
+        from unittest import mock
+
+        class _Detection:
+            def __init__(self, bbox, embedding):
+                self.bbox = bbox
+                self.embedding = embedding
+
+        class _App:
+            def get(self, img):
+                h, w = img.shape[:2]
+                return [
+                    _Detection([x1 * w, y1 * h, x2 * w, y2 * h], emb)
+                    for x1, y1, x2, y2, emb in faces
+                ]
+
+        return mock.patch("face_grouping_web.get_face_app", return_value=_App())
+
+    def test_tag_assign_new_person(self):
+        with self._mock_face_app():
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["created_person"])
+        self.assertEqual(body["group"]["name"], "Carol")
+
+        conn = self.db_conn()
+        gid = conn.execute(
+            "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+            (self.p3,),
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT image_path FROM group_image_paths WHERE group_id=?", (gid,)
+        ).fetchall()
+        conn.close()
+        self.assertGreater(gid, 2, "new person created")
+        self.assertEqual([r[0] for r in rows], [self.p3], "photo linked")
+
+        carol_dir = self.out_root / "Carol"
+        self.assertTrue((carol_dir / "p3_0.jpg").is_file(), "crop written")
+        conn = self.db_conn()
+        rec = conn.execute(
+            "SELECT 1 FROM group_cropped_faces WHERE face_id='p3_0'"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(rec), 1)
+
+        tags = self.client.get(
+            f"/api/photos/tags?{self.q}&path={self.p3}"
+        ).get_json()["tags"]
+        self.assertEqual(tags[0]["name"], "Carol")
+
+    def test_tag_assign_matches_existing_person_case_insensitive(self):
+        with self._mock_face_app():
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "  alice ",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertFalse(body["created_person"])
+        self.assertEqual(body["group"]["name"], "Alice")
+        self.assertTrue((self.g1 / "p3_0.jpg").is_file())
+        conn = self.db_conn()
+        n = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2, "no new group for an existing name")
+
+    def test_tag_existing_person_folds_embedding_like_group_id_path(self):
+        """Name-matched targets carry the same embedding state as group_id."""
+        conn = self.db_conn()
+        conn.execute(
+            "UPDATE groups SET sum_embedding='0.5,0.5,0.5,0.5', count=2 WHERE id=1"
+        )
+        conn.commit()
+        conn.close()
+        with self._mock_face_app(
+            [(0.2, 0.3, 0.6, 0.7, [1.0, 1.0, 1.0, 1.0])]
+        ):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Alice",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.get_json()["created_person"])
+
+        conn = self.db_conn()
+        row = conn.execute(
+            "SELECT sum_embedding, count FROM groups WHERE id=1"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(
+            [float(v) for v in row["sum_embedding"].split(",")],
+            [1.5, 1.5, 1.5, 1.5], "existing sum plus this face",
+        )
+        self.assertEqual(row["count"], 3)
+
+    def test_tag_new_person_initializes_embedding(self):
+        """First-ever assignment seeds the sum (pipeline's fresh-group init)."""
+        with self._mock_face_app(
+            [(0.2, 0.3, 0.6, 0.7, [1.0, 1.0, 1.0, 1.0])]
+        ):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+
+        conn = self.db_conn()
+        row = conn.execute(
+            "SELECT sum_embedding, count FROM groups WHERE name='Carol'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(
+            [float(v) for v in row["sum_embedding"].split(",")],
+            [1.0, 1.0, 1.0, 1.0], "seeded from the tagged face",
+        )
+        self.assertEqual(row["count"], 1)
+
+    def test_tag_decode_failure_returns_500_and_rolls_back(self):
+        """Unreadable source: no partial tag, no phantom crop, no undo."""
+        Path(self.p3).unlink()
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.get_json()["error"], "Could not write face crop")
+
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM groups WHERE name='Carol'"
+            ).fetchone()[0],
+            0, "new group rolled back",
+        )
+        self.assertIsNone(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+                (self.p3,),
+            ).fetchone()[0], "tag assignment rolled back",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p3_0'"
+            ).fetchone()[0],
+            0, "no crop registry entry for a crop that was never written",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0],
+            0, "no undo registered for a failed tag",
+        )
+        conn.close()
+
+        # The rollback must also not leave the freshly created person folder
+        # on disk: that would block retrying the same name.
+        self.assertFalse(
+            (self.out_root / "Carol").exists(),
+            "failed tag must not leave its just-created folder",
+        )
+        _write_photo(self.photos / "p3.jpg")
+        with self._mock_face_app():
+            retry = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(retry.status_code, 200, "name is retryable again")
+        self.assertTrue((self.out_root / "Carol" / "p3_0.jpg").is_file())
+
+    def test_tag_crop_failure_leaves_preexisting_folders(self):
+        """Cleanup is restricted to folders the failed attempt created."""
+        Path(self.p3).unlink()
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p3, "face_idx": 0, "new_name": "Alice",
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 500)
+        self.assertTrue(self.g1.exists(), "pre-existing person folder untouched")
+        self.assertTrue((self.g1 / "p1_0.jpg").is_file())
+        self.assertTrue((self.g1 / "p2_0.jpg").is_file())
+        conn = self.db_conn()
+        n = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2, "no partial group survived the failure")
+
+    def test_tag_alloc_failure_leaves_no_folder(self):
+        """Group id/insert failure inside creation: no folder, retryable name."""
+        from unittest import mock
+        with mock.patch("face_grouping_web.next_group_id",
+                        side_effect=RuntimeError("alloc failed")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    "/api/photos/tag",
+                    json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                          "db_file": str(self.db_file)},
+                )
+        self.assertFalse(
+            (self.out_root / "Carol").exists(), "no folder on alloc failure"
+        )
+        conn = self.db_conn()
+        n = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2, "no partial group row")
+
+    def test_tag_relink_failure_removes_new_person_folder(self):
+        """A later database failure still cleans this request's folder+crop."""
+        from unittest import mock
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=RuntimeError("relink boom")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    "/api/photos/tag",
+                    json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                          "db_file": str(self.db_file)},
+                )
+        self.assertFalse((self.out_root / "Carol").exists())
+        self.assertFalse((self.out_root / "Carol" / "p3_0.jpg").exists())
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM groups WHERE name='Carol'"
+            ).fetchone()[0], 0, "assignment rolled back",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p3_0'"
+            ).fetchone()[0], 0, "crop registration rolled back",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0],
+            0, "no undo registered for a failed tag",
+        )
+        conn.close()
+
+    def test_tag_move_failure_returns_400_and_cleans_up(self):
+        """Move into a fresh folder then fail: 400 and the folder is removed."""
+        from unittest import mock
+        self.assertTrue((self.g1 / "p1_0.jpg").is_file())
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=OSError("relink boom")):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p1, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse((self.out_root / "Carol").exists())
+        self.assertFalse(
+            (self.out_root / "Carol" / "p1_0.jpg").exists(),
+            "moved crop removed after the failure",
+        )
+        self.assertTrue(
+            (self.g1 / "p1_0.jpg").is_file(),
+            "moved crop restored to its source person",
+        )
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+                (self.p1,),
+            ).fetchone()[0], 1, "assignment rolled back to Alice",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p1_0'"
+            ).fetchone()[0], 1, "old crop registration restored by rollback",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
+        )
+        conn.close()
+
+    def test_tag_restore_failure_preserves_the_moved_crop(self):
+        """A completed move's copy survives a failed restoration (logged)."""
+        from unittest import mock
+
+        real_move = shutil.move
+        calls = {"n": 0}
+
+        def fake_move(src, dst):
+            # First call is the actual crop move; the restore call fails.
+            if calls["n"] == 0:
+                calls["n"] += 1
+                return real_move(src, dst)
+            raise OSError("restore boom")
+
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=OSError("relink boom")), \
+                mock.patch("face_grouping_web.shutil.move",
+                           side_effect=fake_move):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p1, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 400)
+        # Restore failed, but the crop was moved: keep the copy — do NOT
+        # fall through to unlinking the destination.
+        self.assertTrue((self.out_root / "Carol").exists())
+        self.assertTrue(
+            (self.out_root / "Carol" / "p1_0.jpg").is_file(),
+            "completed destination preserved when restore failed",
+        )
+        self.assertFalse((self.g1 / "p1_0.jpg").exists())
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+                (self.p1,),
+            ).fetchone()[0], 1, "assignment rolled back to Alice",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
+        )
+        conn.close()
+
+    def test_tag_move_failure_restores_crop_to_source_person(self):
+        """Failed move into an existing person: the crop goes back home."""
+        from unittest import mock
+        self.assertTrue((self.g2 / "p1_1.jpg").is_file())
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=OSError("relink boom")):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p1, "face_idx": 1, "group_id": 1,
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(
+            (self.g1 / "p1_1.jpg").exists(), "not stranded in the target folder"
+        )
+        self.assertTrue(
+            (self.g2 / "p1_1.jpg").is_file(), "crop restored to its source"
+        )
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=1",
+                (self.p1,),
+            ).fetchone()[0], 2, "assignment rolled back to Bob",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM group_cropped_faces WHERE face_id='p1_1'"
+            ).fetchone()[0], 2, "crop registration rolled back to Bob",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
+        )
+        conn.close()
+
+    def test_tag_change_person_moves_crop_and_undo_restores(self):
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p1, "face_idx": 0, "group_id": 2,
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse((self.g1 / "p1_0.jpg").exists())
+        self.assertTrue((self.g2 / "p1_0.jpg").exists())
+        conn = self.db_conn()
+        gid = conn.execute(
+            "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+            (self.p1,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(gid, 2)
+
+        undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
+        self.assertEqual(undo.status_code, 200)
+        self.assertTrue((self.g1 / "p1_0.jpg").exists())
+        self.assertFalse((self.g2 / "p1_0.jpg").exists())
+        conn = self.db_conn()
+        gid = conn.execute(
+            "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+            (self.p1,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(gid, 1, "tag reverted to Alice")
+
+    def test_tag_undo_new_person_assignment(self):
+        with self._mock_face_app():
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 200)
+        undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
+        self.assertEqual(undo.status_code, 200)
+        conn = self.db_conn()
+        gid = conn.execute(
+            "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+            (self.p3,),
+        ).fetchone()[0]
+        crop_rec = conn.execute(
+            "SELECT 1 FROM group_cropped_faces WHERE face_id='p3_0'"
+        ).fetchone()
+        linked = conn.execute(
+            "SELECT 1 FROM group_image_paths WHERE image_path=? "
+            "AND group_id=(SELECT MAX(id) FROM groups)",
+            (self.p3,),
+        ).fetchone()
+        conn.close()
+        self.assertIsNone(gid, "tag back to unnamed")
+        self.assertIsNone(crop_rec)
+        self.assertIsNone(linked, "photo link removed")
+        self.assertFalse((self.out_root / "Carol" / "p3_0.jpg").exists())
+        self.assertTrue((self.out_root / ".trash").is_dir(), "crop parked in trash")
+
+    def test_tag_rejects_detached_face(self):
+        resp = self.client.delete(f"/api/groups/1/faces/p2_0.jpg?{self.q}")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p2, "face_idx": 0, "group_id": 2,
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_tag_validates_request(self):
+        for body in (
+            {"new_name": ".."},
+            {"group_id": 99},
+            {"group_id": 1, "new_name": "Both"},
+        ):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={
+                    "path": self.p3, "face_idx": 0,
+                    "db_file": str(self.db_file), **body,
+                },
+            )
+            self.assertEqual(resp.status_code, 400, body)
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": self.p3, "face_idx": 5, "new_name": "X",
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 404, "no such face index")
+        resp = self.client.post(
+            "/api/photos/tag",
+            json={"path": "C:/Windows/win.ini", "face_idx": 0, "group_id": 1,
+                  "db_file": str(self.db_file)},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_tag_blocked_while_running(self):
+        from face_grouping_web import run_state
+
+        run_state.reset()  # simulate an active run
+        try:
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p3, "face_idx": 0, "group_id": 1,
+                      "db_file": str(self.db_file)},
+            )
+            self.assertEqual(resp.status_code, 409)
+        finally:
+            with run_state.lock:
+                run_state.running = False
+
+
 if __name__ == "__main__":
     unittest.main()
 

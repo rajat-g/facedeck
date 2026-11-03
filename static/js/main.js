@@ -9,6 +9,7 @@ import { initDuplicates, loadDuplicates } from "./duplicates.js";
 import { initFaceless, loadFaceless } from "./faceless.js";
 import { initNav } from "./nav.js";
 import { initSearch } from "./search.js";
+import { closePhotoViewer, initPhotos, photoViewerIsOpen } from "./photos.js";
 import { startFacelessRescan } from "./run.js";
 import { closeLightbox, initLightbox, lightboxIsOpen, lightboxNavigate, openFaceViewer } from "./lightbox.js";
 import { closeMoveModal, initMoveModal, moveModalIsOpen, openMoveModal } from "./movemodal.js";
@@ -65,9 +66,11 @@ $("#undo-btn").addEventListener("click", async () => {
 /* ---------- Keyboard shortcuts ---------- */
 
 document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { closeLightbox(); closeMoveModal(); return; }
+    if (e.key === "Escape") { closePhotoViewer(); closeLightbox(); closeMoveModal(); return; }
     const tag = document.activeElement?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+    if (photoViewerIsOpen()) return; // photos.js owns ←/→ there
 
     if (lightboxIsOpen()) {
         switch (e.key) {
@@ -137,6 +140,7 @@ initMoveModal(loadGroups);
 initDuplicates(loadGroups);
 initFaceless(startFacelessRescan);
 initSearch();
+initPhotos();
 initNav();
 
 loadSettings();

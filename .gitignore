@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.thumbnail_cache/
+.thumbnails/
 Output/
 output_faces/
 Test/
