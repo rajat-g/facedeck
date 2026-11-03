@@ -2176,6 +2176,7 @@ def api_photos_tag():
     # pre-existing folders are never touched.
     request_dir = None        # person folder created by this request
     request_crop_file = None  # crop file this request placed in that folder
+    request_crop_src = None   # where a request-moved crop came from
     try:
         known = conn.execute(
             "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
@@ -2253,8 +2254,11 @@ def api_photos_tag():
                 # Track the destination before moving: if move_single_face
                 # fails at any internal point (the file itself is part of
                 # that move), the finally cleanup must still find it — an
-                # absent file just makes unlink a no-op.
+                # absent file just makes unlink a no-op. Remember the source
+                # too, so a failed request can put the crop back where the
+                # (restored) registry says it belongs.
                 request_crop_file = Path(target["directory"]) / crop_name
+                request_crop_src = src_file
                 try:
                     undo_item = move_single_face(
                         conn, old_crop["group_id"], crop_name,
@@ -2346,18 +2350,33 @@ def api_photos_tag():
         conn.commit()
         request_dir = None  # committed — keep the person folder and its crop
         request_crop_file = None
+        request_crop_src = None
         return jsonify(
             {"ok": True,
              "group": {"id": target_id, "name": target["name"] or Path(target["directory"]).name},
              "created_person": created_person}
         )
     finally:
+        if request_crop_src is not None:
+            # A move may have taken the crop out of its person's folder. When
+            # the transaction never committed, put it back so the registry
+            # (restored by the rollback) stays truthful — even when no fresh
+            # folder was created. Skip when the file never left or its source
+            # slot was refilled meanwhile; keep disk state rather than risk
+            # overwriting something.
+            try:
+                if (request_crop_file is not None and request_crop_file.exists()
+                        and not request_crop_src.exists()):
+                    shutil.move(str(request_crop_file), str(request_crop_src))
+            except OSError:
+                pass
         if request_dir is not None:
             # The transaction never committed: remove only what this request
             # put on disk — its crop and its person folder — so the same name
             # stays retryable (`_create_group_for_tag` refuses an existing
-            # folder). Untracked content remains: rmdir only succeeds on the
-            # folder, and a rmdir error leaves it untouched.
+            # folder). A restored crop is already gone from here (unlink is a
+            # no-op), and untracked content remains: rmdir only succeeds on
+            # an emptied folder, leaving anything else untouched.
             try:
                 if request_crop_file is not None:
                     request_crop_file.unlink(missing_ok=True)

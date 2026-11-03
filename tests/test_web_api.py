@@ -2335,6 +2335,10 @@ class PhotoWallTestCase(unittest.TestCase):
             (self.out_root / "Carol" / "p1_0.jpg").exists(),
             "moved crop removed after the failure",
         )
+        self.assertTrue(
+            (self.g1 / "p1_0.jpg").is_file(),
+            "moved crop restored to its source person",
+        )
         conn = self.db_conn()
         self.assertEqual(
             conn.execute(
@@ -2346,6 +2350,41 @@ class PhotoWallTestCase(unittest.TestCase):
             conn.execute(
                 "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p1_0'"
             ).fetchone()[0], 1, "old crop registration restored by rollback",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
+        )
+        conn.close()
+
+    def test_tag_move_failure_restores_crop_to_source_person(self):
+        """Failed move into an existing person: the crop goes back home."""
+        from unittest import mock
+        self.assertTrue((self.g2 / "p1_1.jpg").is_file())
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=OSError("relink boom")):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p1, "face_idx": 1, "group_id": 1,
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(
+            (self.g1 / "p1_1.jpg").exists(), "not stranded in the target folder"
+        )
+        self.assertTrue(
+            (self.g2 / "p1_1.jpg").is_file(), "crop restored to its source"
+        )
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=1",
+                (self.p1,),
+            ).fetchone()[0], 2, "assignment rolled back to Bob",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM group_cropped_faces WHERE face_id='p1_1'"
+            ).fetchone()[0], 2, "crop registration rolled back to Bob",
         )
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
