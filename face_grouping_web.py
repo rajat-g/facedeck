@@ -2080,13 +2080,16 @@ def _create_group_for_tag(conn, name):
     dst_dir = parent / name
     if dst_dir.exists():
         raise FileExistsError("A folder with this name already exists")
-    dst_dir.mkdir(parents=True)
     new_id = next_group_id(conn)
+    # Row first, folder last: if id allocation or the insert fails, nothing
+    # was created on disk; a late mkdir failure merely discards the
+    # uncommitted row when its connection closes.
     conn.execute(
         "INSERT INTO groups(id, sum_embedding, count, directory, name) "
         "VALUES (?, '', 0, ?, ?)",
         (new_id, str(dst_dir), name),
     )
+    dst_dir.mkdir(parents=True)
     return {
         "id": new_id,
         "name": name,
@@ -2168,6 +2171,11 @@ def api_photos_tag():
     if not Path(db_file).exists():
         return jsonify({"error": "Database file does not exist"}), 404
     conn = open_db(db_file)
+    # On-disk artifacts this request itself created. Removed in the finally
+    # unless the transaction committed, so a failed tagging can be retried;
+    # pre-existing folders are never touched.
+    request_dir = None        # person folder created by this request
+    request_crop_file = None  # crop file this request placed in that folder
     try:
         known = conn.execute(
             "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
@@ -2205,6 +2213,7 @@ def api_photos_tag():
                 except FileExistsError as exc:
                     return jsonify({"error": str(exc)}), 400
                 created_person = True
+                request_dir = Path(target["directory"])
         else:
             grow = conn.execute(
                 "SELECT id, name, directory, sum_embedding, count FROM groups WHERE id=?",
@@ -2241,6 +2250,11 @@ def api_photos_tag():
             ).fetchone()
             src_file = Path(src_row["directory"]) / crop_name
             if src_file.exists():
+                # Track the destination before moving: if move_single_face
+                # fails at any internal point (the file itself is part of
+                # that move), the finally cleanup must still find it — an
+                # absent file just makes unlink a no-op.
+                request_crop_file = Path(target["directory"]) / crop_name
                 try:
                     undo_item = move_single_face(
                         conn, old_crop["group_id"], crop_name,
@@ -2261,6 +2275,10 @@ def api_photos_tag():
             dst_file = Path(target["directory"]) / crop_name
             created_crop = False
             if not dst_file.exists():
+                # Track before writing: a mid-write failure can leave a
+                # partial file behind that the finally cleanup must remove.
+                if request_dir is not None:
+                    request_crop_file = dst_file
                 try:
                     _crop_from_photo(
                         tag_source, [row["x1"], row["y1"], row["x2"], row["y2"]], dst_file
@@ -2269,17 +2287,6 @@ def api_photos_tag():
                 except Exception:
                     traceback.print_exc()
                     conn.rollback()
-                    if created_person:
-                        # `_create_group_for_tag` refuses an existing folder, so
-                        # leaving the just-created folder would permanently
-                        # block retrying this name after a rollback. Remove
-                        # only what this attempt produced (the crop inside a
-                        # folder created here); pre-existing folders stay.
-                        try:
-                            dst_file.unlink(missing_ok=True)
-                            Path(target["directory"]).rmdir()
-                        except OSError:
-                            pass  # folder no longer empty — somebody else's; keep
                     return jsonify({"error": "Could not write face crop"}), 500
             conn.execute(
                 "INSERT OR IGNORE INTO group_cropped_faces(group_id, face_id) VALUES (?, ?)",
@@ -2337,12 +2344,26 @@ def api_photos_tag():
 
         record_undo(conn, "tag", [undo_item])
         conn.commit()
+        request_dir = None  # committed — keep the person folder and its crop
+        request_crop_file = None
         return jsonify(
             {"ok": True,
              "group": {"id": target_id, "name": target["name"] or Path(target["directory"]).name},
              "created_person": created_person}
         )
     finally:
+        if request_dir is not None:
+            # The transaction never committed: remove only what this request
+            # put on disk — its crop and its person folder — so the same name
+            # stays retryable (`_create_group_for_tag` refuses an existing
+            # folder). Untracked content remains: rmdir only succeeds on the
+            # folder, and a rmdir error leaves it untouched.
+            try:
+                if request_crop_file is not None:
+                    request_crop_file.unlink(missing_ok=True)
+                request_dir.rmdir()
+            except OSError:
+                pass  # gained foreign content — not solely ours; keep
         conn.close()
 
 

@@ -2269,6 +2269,89 @@ class PhotoWallTestCase(unittest.TestCase):
         conn.close()
         self.assertEqual(n, 2, "no partial group survived the failure")
 
+    def test_tag_alloc_failure_leaves_no_folder(self):
+        """Group id/insert failure inside creation: no folder, retryable name."""
+        from unittest import mock
+        with mock.patch("face_grouping_web.next_group_id",
+                        side_effect=RuntimeError("alloc failed")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    "/api/photos/tag",
+                    json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                          "db_file": str(self.db_file)},
+                )
+        self.assertFalse(
+            (self.out_root / "Carol").exists(), "no folder on alloc failure"
+        )
+        conn = self.db_conn()
+        n = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2, "no partial group row")
+
+    def test_tag_relink_failure_removes_new_person_folder(self):
+        """A later database failure still cleans this request's folder+crop."""
+        from unittest import mock
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=RuntimeError("relink boom")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    "/api/photos/tag",
+                    json={"path": self.p3, "face_idx": 0, "new_name": "Carol",
+                          "db_file": str(self.db_file)},
+                )
+        self.assertFalse((self.out_root / "Carol").exists())
+        self.assertFalse((self.out_root / "Carol" / "p3_0.jpg").exists())
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM groups WHERE name='Carol'"
+            ).fetchone()[0], 0, "assignment rolled back",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p3_0'"
+            ).fetchone()[0], 0, "crop registration rolled back",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0],
+            0, "no undo registered for a failed tag",
+        )
+        conn.close()
+
+    def test_tag_move_failure_returns_400_and_cleans_up(self):
+        """Move into a fresh folder then fail: 400 and the folder is removed."""
+        from unittest import mock
+        self.assertTrue((self.g1 / "p1_0.jpg").is_file())
+        with mock.patch("face_grouping_web.relink_photo",
+                        side_effect=OSError("relink boom")):
+            resp = self.client.post(
+                "/api/photos/tag",
+                json={"path": self.p1, "face_idx": 0, "new_name": "Carol",
+                      "db_file": str(self.db_file)},
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse((self.out_root / "Carol").exists())
+        self.assertFalse(
+            (self.out_root / "Carol" / "p1_0.jpg").exists(),
+            "moved crop removed after the failure",
+        )
+        conn = self.db_conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT group_id FROM photo_faces WHERE image_path=? AND face_idx=0",
+                (self.p1,),
+            ).fetchone()[0], 1, "assignment rolled back to Alice",
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM group_cropped_faces WHERE face_id='p1_0'"
+            ).fetchone()[0], 1, "old crop registration restored by rollback",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM undo_log").fetchone()[0], 0
+        )
+        conn.close()
+
     def test_tag_change_person_moves_crop_and_undo_restores(self):
         resp = self.client.post(
             "/api/photos/tag",
