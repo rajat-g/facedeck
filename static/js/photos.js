@@ -605,7 +605,7 @@ async function assign(tag, facePos, opts) {
             ? `New person “${res.group.name}” saved.`
             : `Face named “${res.group.name}”.`);
         document.dispatchEvent(new CustomEvent("groups-refreshed"));
-        await reloadTagData();
+        await reloadTagData(body.path);
     } catch (err) {
         hidePvLoading();
         toastError(err.message);
@@ -618,18 +618,19 @@ function hidePvLoading() {
     $("#pv-loading").classList.add("hidden");
 }
 
-async function reloadTagData() {
+async function reloadTagData(path) {
     if (!pv) { hidePvLoading(); return; }
-    const path = pv.path;
+    path = path || pv.path;
     try {
         const data = await api(`/api/photos/tags?path=${encodeURIComponent(path)}`);
+        const tags = data.tags || [];
+        updateTileChips(path, tags);
         if (!pv || pv.path !== path || !photoViewerIsOpen()) { hidePvLoading(); return; }
-        pv.tags = data.tags || [];
+        pv.tags = tags;
         pv.duplicateOf = data.duplicate_of || pv.duplicateOf;
         hidePvLoading();
         renderBoxes();
         renderViewerMeta();
-        updateTileChips(path, pv.tags);
     } catch (err) {
         hidePvLoading();
         toastError(err.message);

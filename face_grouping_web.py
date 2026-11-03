@@ -2186,6 +2186,7 @@ def api_photos_tag():
     request_crop_file = None  # crop file this request placed in that folder
     request_crop_src = None   # where a request-moved crop came from
     try:
+        conn.execute("BEGIN IMMEDIATE")
         known = conn.execute(
             "SELECT 1 FROM processed_files WHERE file_path=?", (path,)
         ).fetchone()
