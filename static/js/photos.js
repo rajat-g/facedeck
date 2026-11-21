@@ -23,7 +23,7 @@ const STACK = {
 };
 
 let pv = null; // active viewer state {path, kind, list, index, tags, duplicateOf, busy}
-let gridRefreshPending = false; // face-tag change made grids stale while the viewer is open
+const staleGrids = new Set(); // grids whose items may be stale after a face-tag change while the viewer is open
 const tagReqSeqs = new Map(); // latest reloadTagData request id per photo path
 
 /* ---------- init ---------- */
@@ -110,7 +110,20 @@ function resetIfVisible(key) {
     hardReload(w);
 }
 
+function isPageVisible(key) {
+    const page = $(`#page-${key}`);
+    return !page || !page.classList.contains("hidden");
+}
+
 function ensureLoaded(w) {
+    if (staleGrids.has(w.name)) {
+        // Tagging invalidated this grid while it was hidden: refresh it
+        // before it is shown again, even when it already has a page loaded.
+        if (pv && pv.kind === w.name) return; // the open viewer depends on this grid
+        staleGrids.delete(w.name);
+        hardReload(w);
+        return;
+    }
     if (!w.page && !w.loading) hardReload(w);
 }
 
@@ -306,13 +319,16 @@ export function closePhotoViewer() {
     $("#photo-viewer").classList.add("hidden");
     closePopover();
     pv = null;
-    if (gridRefreshPending) {
-        // The viewer no longer depends on the grids' items: refresh what's
-        // visible, then clear the pending state so unchanged grids are not
-        // reloaded again later.
-        gridRefreshPending = false;
-        resetIfVisible("photos");
-        resetIfVisible("find");
+    if (staleGrids.size) {
+        // The viewer no longer depends on the grids' items: refresh the
+        // visible grids as before; hidden ones stay marked stale so they
+        // refresh before being shown again.
+        for (const key of ["photos", "find"]) {
+            if (staleGrids.has(key) && isPageVisible(key)) {
+                staleGrids.delete(key);
+                hardReload(STACK[key]);
+            }
+        }
     }
 }
 
@@ -665,7 +681,13 @@ async function reloadTagData(path) {
         }
         pv.tags = tags;
         pv.duplicateOf = data.duplicate_of || pv.duplicateOf;
-        if (changed) gridRefreshPending = true; // face-tag change while viewer open → refresh on close
+        if (changed) {
+            // A face-tag change while the viewer is open invalidates both
+            // grids: visible ones refresh on close; hidden ones (e.g. search
+            // results) refresh before being shown again.
+            staleGrids.add("photos");
+            staleGrids.add("find");
+        }
         hidePvLoading();
         renderBoxes();
         renderViewerMeta();
