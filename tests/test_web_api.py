@@ -1,10 +1,14 @@
+import io
 import json
+import os
 import re
 import shutil
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from face_grouping_v5 import open_db
 from face_grouping_web import app
@@ -2018,6 +2022,75 @@ class PhotoWallTestCase(unittest.TestCase):
         )
         self.assertEqual(len(self.wall("&q=zzz-nothing")["photos"]), 0)
 
+    def test_wall_filtered_pages_have_stable_order_and_total(self):
+        for page, expected in ((1, [self.p1]), (2, [self.p2]), (3, [])):
+            with self.subTest(page=page):
+                body = self.wall(f"&q=%20aLiCe%20&per_page=1&page={page}")
+                self.assertEqual(list(self.by_path(body)), expected)
+                self.assertEqual(body["total"], 2)
+                self.assertEqual(body["page"], page)
+
+    def test_wall_normalizes_pagination(self):
+        for qs, expected_size, expected_count in (
+            ("&page=bad&per_page=bad", 60, 4),
+            ("&page=-1&per_page=0", 1, 1),
+            ("&page=0&per_page=999", 200, 4),
+        ):
+            with self.subTest(qs=qs):
+                body = self.wall(qs)
+                self.assertEqual(body["page"], 1)
+                self.assertEqual(body["per_page"], expected_size)
+                self.assertEqual(len(body["photos"]), expected_count)
+
+    def test_wall_search_treats_like_metacharacters_as_literal(self):
+        with self.db_conn() as conn:
+            # Folder names are searchable too; exclude fixture underscores.
+            conn.execute("UPDATE groups SET directory=? WHERE id=1", ("alice",))
+            conn.execute("UPDATE groups SET name=? WHERE id=2", ("Bob_%",))
+        conn.close()
+        for query in ("_", "%"):
+            with self.subTest(query=query):
+                resp = self.client.get("/api/photos", query_string={
+                    "q": query, "db_file": str(self.db_file),
+                })
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(set(self.by_path(resp.get_json())), {self.p1})
+
+    def test_wall_uses_current_crop_owner_for_search_and_tags(self):
+        # A crop move can leave a historical group ID in the stored photo row.
+        with self.db_conn() as conn:
+            conn.execute(
+                "UPDATE group_cropped_faces SET group_id=2 WHERE face_id='p2_0'"
+            )
+        conn.close()
+        self.assertEqual(set(self.by_path(self.wall("&q=alice"))), {self.p1})
+        wall = self.by_path(self.wall("&q=bob"))
+        self.assertEqual(set(wall), {self.p1, self.p2})
+        self.assertEqual(wall[self.p2]["people"], [{"id": 2, "name": "Bob"}])
+
+        resp = self.client.get(f"/api/photos/tags?{self.q}&path={self.p2}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {
+            "duplicate_of": None,
+            "tags": [{
+                "face_idx": 0, "face_id": "p2_0", "group_id": 2, "name": "Bob",
+                "bbox": [0.2, 0.2, 0.5, 0.6], "has_crop": True,
+            }],
+        })
+
+    def test_photo_navigation_keeps_search_by_example_route(self):
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        html = resp.get_data(as_text=True)
+        tabs = re.findall(r'<button data-page="([^"]+)"[^>]*>([^<]+)', html)
+        self.assertEqual([(route, label.strip()) for route, label in tabs], [
+            ("people", "People"), ("photos", "Photos"), ("find", "Search"),
+            ("search", "Example"), ("review", "Review"),
+        ])
+        for route, _ in tabs:
+            with self.subTest(route=route):
+                self.assertEqual(html.count(f'id="page-{route}"'), 1)
+
     # ---------- tags for any processed photo ----------
 
     def test_photos_tags_serve_any_processed_photo(self):
@@ -2066,6 +2139,67 @@ class PhotoWallTestCase(unittest.TestCase):
             f"/api/thumb?db_file={ghost.as_posix()}&path={self.p1}"
         )
         self.assertEqual(resp.status_code, 404)
+
+    def _thumbnail(self, path, size=320):
+        resp = self.client.get("/api/thumb", query_string={
+            "db_file": str(self.db_file), "path": path, "size": size,
+        })
+        self.addCleanup(resp.close)
+        return resp
+
+    def test_thumb_orients_and_downscales_with_size_bounds(self):
+        from PIL import Image
+
+        image = Image.new("RGB", (1600, 800))
+        exif = image.getexif()
+        exif[274] = 6  # Stored sideways; display rotated 90 degrees clockwise.
+        image.save(self.p1, exif=exif)
+        for size, expected in ((1, (120, 240)), ("bad", (160, 320)), (9999, (640, 1280))):
+            with self.subTest(size=size):
+                resp = self._thumbnail(self.p1, size)
+                self.assertEqual(resp.status_code, 200)
+                with Image.open(io.BytesIO(resp.get_data())) as thumb:
+                    self.assertEqual(thumb.format, "JPEG")
+                    self.assertEqual(thumb.size, expected)
+
+    def test_thumb_reuses_unchanged_source_and_regenerates_after_edit(self):
+        from PIL import Image
+
+        first = self._thumbnail(self.p1)
+        self.assertEqual(first.status_code, 200)
+        first_bytes = first.get_data()
+        with mock.patch("face_grouping_web._generate_thumbnail") as generate:
+            cached = self._thumbnail(self.p1)
+            self.assertEqual(cached.status_code, 200)
+            self.assertEqual(cached.get_data(), first_bytes)
+        generate.assert_not_called()
+
+        old_mtime = Path(self.p1).stat().st_mtime
+        _write_photo(Path(self.p1), w=96, h=64)
+        os.utime(self.p1, (old_mtime + 60, old_mtime + 60))
+        edited = self._thumbnail(self.p1)
+        self.assertEqual(edited.status_code, 200)
+        self.assertNotEqual(edited.get_data(), first_bytes)
+        with Image.open(io.BytesIO(edited.get_data())) as thumb:
+            self.assertEqual(thumb.size, (96, 64))
+
+    def test_thumb_denies_existing_photo_outside_processed_set(self):
+        unprocessed = self.photos / "unprocessed.jpg"
+        _write_photo(unprocessed)
+        resp = self._thumbnail(str(unprocessed))
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse((self.tmp / ".thumbnail_cache").exists())
+
+    def test_thumb_cleans_up_partial_file_and_allows_retry(self):
+        def interrupted_write(src, size, dst):
+            dst.with_name(dst.name + ".part").write_bytes(b"partial JPEG")
+            raise OSError("simulated write failure")
+
+        with mock.patch("face_grouping_web._generate_thumbnail",
+                        side_effect=interrupted_write):
+            self.assertEqual(self._thumbnail(self.p1).status_code, 500)
+        self.assertEqual(list((self.tmp / ".thumbnail_cache").iterdir()), [])
+        self.assertEqual(self._thumbnail(self.p1).status_code, 200)
 
     # ---------- tagging (add / change names) ----------
 
@@ -2494,6 +2628,49 @@ class PhotoWallTestCase(unittest.TestCase):
         self.assertFalse((self.out_root / "Carol" / "p3_0.jpg").exists())
         self.assertTrue((self.out_root / ".trash").is_dir(), "crop parked in trash")
 
+    def test_tagging_duplicate_updates_canonical_and_undo_restores_both_views(self):
+        before = {}
+        for path in (self.p1, self.d1):
+            resp = self.client.get(f"/api/photos/tags?{self.q}&path={path}")
+            self.assertEqual(resp.status_code, 200)
+            before[path] = resp.get_json()
+
+        resp = self.client.post("/api/photos/tag", json={
+            "path": self.d1, "face_idx": 0, "group_id": 2,
+            "db_file": str(self.db_file),
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["group"], {"id": 2, "name": "Bob"})
+        for path in (self.p1, self.d1):
+            with self.subTest(path=path):
+                tagged = self.client.get(f"/api/photos/tags?{self.q}&path={path}").get_json()
+                old = before[path]
+                self.assertEqual(tagged["duplicate_of"], old["duplicate_of"])
+                self.assertEqual(tagged["tags"], [
+                    dict(old["tags"][0], group_id=2, name="Bob"), *old["tags"][1:],
+                ])
+
+        undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
+        self.assertEqual(undo.status_code, 200)
+        for path, expected in before.items():
+            resp = self.client.get(f"/api/photos/tags?{self.q}&path={path}")
+            self.assertEqual(resp.get_json(), expected)
+
+    def test_tagging_same_person_does_not_add_an_undo_entry(self):
+        crop = self.g1 / "p1_0.jpg"
+        before = crop.read_bytes()
+        resp = self.client.post("/api/photos/tag", json={
+            "path": self.p1, "face_idx": 0, "new_name": "GROUP_1",
+            "db_file": str(self.db_file),
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["unchanged"])
+        self.assertFalse(resp.get_json()["created_person"])
+        self.assertEqual(resp.get_json()["group"]["id"], 1)
+        self.assertEqual(crop.read_bytes(), before)
+        undo = self.client.post("/api/undo", json={"db_file": str(self.db_file)})
+        self.assertEqual(undo.status_code, 404)
+
     def test_tag_rejects_detached_face(self):
         resp = self.client.delete(f"/api/groups/1/faces/p2_0.jpg?{self.q}")
         self.assertEqual(resp.status_code, 200)
@@ -2545,6 +2722,32 @@ class PhotoWallTestCase(unittest.TestCase):
         finally:
             with run_state.lock:
                 run_state.running = False
+
+
+class TagEmbeddingTestCase(unittest.TestCase):
+    def test_embedding_chooses_best_overlap_among_detections(self):
+        from face_grouping_web import _face_embedding_for_tag
+
+        weaker = SimpleNamespace(bbox=(0, 0, 8, 10), embedding=object())
+        best = SimpleNamespace(bbox=(0, 0, 10, 10), embedding=object())
+        other = SimpleNamespace(bbox=(20, 0, 30, 10), embedding=object())
+        face_app = mock.Mock()
+        for detections in ([weaker, best, other], [best, weaker, other]):
+            with self.subTest(detections=detections):
+                face_app.get.return_value = detections
+                self.assertIs(
+                    _face_embedding_for_tag(face_app, object(), (0, 0, 10, 10)),
+                    best.embedding,
+                )
+
+    def test_embedding_requires_overlap_strictly_above_half(self):
+        from face_grouping_web import _face_embedding_for_tag
+
+        face_app = mock.Mock()
+        for detections in ([], [SimpleNamespace(bbox=(0, 0, 5, 10), embedding=object())]):
+            with self.subTest(detections=detections):
+                face_app.get.return_value = detections
+                self.assertIsNone(_face_embedding_for_tag(face_app, object(), (0, 0, 10, 10)))
 
 
 if __name__ == "__main__":
