@@ -1,13 +1,14 @@
-/* Top-level pages: People | Review. Hash-routed (#/people, #/review) with a
-   localStorage fallback; the Review tab carries a badge with the number of
-   open items (duplicate sets + faceless photos) so nothing gets ignored. */
+/* Top-level pages: People | Photos | Search | By example. Hash-routed
+   (#/people, #/photos, …) with a localStorage fallback; the Review tab
+   carries a badge with the number of open items (duplicate sets + faceless
+   photos) so nothing gets ignored. */
 
 import { getDupeSetCount } from "./duplicates.js";
 import { getFacelessCount } from "./faceless.js";
 
 const PAGE_KEY = "facedeck-page";
 
-const PAGES = ["people", "review", "search"];
+const PAGES = ["people", "photos", "find", "search", "review"];
 
 function pageFromHash() {
     const h = (window.location.hash || "").replace(/^#\/?/, "");
@@ -46,6 +47,8 @@ export function showPage(name, push = false) {
     const want = `#/${name}`;
     if (push && window.location.hash !== want) window.location.hash = want;
     updateNavBadges();
+    // Lazily-built pages (photo grids) populate themselves on first view.
+    document.dispatchEvent(new CustomEvent("page-shown", { detail: { name } }));
 }
 
 export function updateNavBadges() {

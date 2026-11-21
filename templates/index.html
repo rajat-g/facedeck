@@ -23,8 +23,10 @@
             <div class="topbar-right">
                 <nav class="topnav" aria-label="Pages">
                     <button data-page="people" class="topnav-btn active">People</button>
+                    <button data-page="photos" class="topnav-btn">Photos</button>
+                    <button data-page="find" class="topnav-btn">Search</button>
+                    <button data-page="search" class="topnav-btn">Example</button>
                     <button data-page="review" class="topnav-btn">Review <span id="nav-review-badge" class="nav-badge" hidden></span></button>
-                    <button data-page="search" class="topnav-btn">Search</button>
                 </nav>
                 <div id="header-stat" class="header-stat hidden">
                     <span class="dot" aria-hidden="true"></span>
@@ -222,6 +224,54 @@
         </section>
         </div>
 
+        <!-- Page: Photos (every processed photo, click to tag faces) -->
+        <div id="page-photos" class="page hidden">
+        <section class="card" aria-label="All photos">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">All photos <span id="photos-info" class="count-pill"></span></h2>
+                <div class="toolbar-filters">
+                    <button id="photos-refresh" class="btn" title="Reload the photo grid">↻ Refresh</button>
+                </div>
+            </div>
+            <p class="muted small dupe-hint">Every processed photo. Click one to see a box around each face — click a box to add or change its name.</p>
+            <div id="photos-empty" class="empty hidden">
+                <div class="empty-ico" aria-hidden="true">🖼</div>
+                <h3>No photos yet</h3>
+                <p class="muted">Run grouping on a folder first — every processed photo then shows up here.</p>
+            </div>
+            <div id="photos-grid" class="wall-grid" aria-label="All photos grid"></div>
+            <div id="photos-sentry" class="wall-sentry" aria-hidden="true"></div>
+            <div class="wall-more">
+                <button id="photos-loadmore" class="btn hidden">Load more photos</button>
+            </div>
+        </section>
+        </div>
+
+        <!-- Page: Search photos -->
+        <div id="page-find" class="page hidden">
+        <section class="card" aria-label="Search photos">
+            <div class="toolbar-row">
+                <h2 class="toolbar-title">Search photos <span id="find-info" class="count-pill"></span></h2>
+                <div class="search">
+                    <span class="search-ico" aria-hidden="true">⌕</span>
+                    <input type="search" id="find-input" placeholder="Photo name or person name…" autocomplete="off">
+                    <button id="find-clear" class="icon-btn hidden" title="Clear search">✕</button>
+                </div>
+            </div>
+            <p class="muted small dupe-hint">Matches photo file names and the people tagged in them. Click a photo to open it with face boxes.</p>
+            <div id="find-empty" class="empty hidden">
+                <div class="empty-ico" aria-hidden="true">⌕</div>
+                <h3>Type to search photos</h3>
+                <p class="muted">Search by photo name or person name.</p>
+            </div>
+            <div id="find-grid" class="wall-grid" aria-label="Search results"></div>
+            <div id="find-sentry" class="wall-sentry" aria-hidden="true"></div>
+            <div class="wall-more">
+                <button id="find-loadmore" class="btn hidden">Load more matches</button>
+            </div>
+        </section>
+        </div>
+
         <!-- Page: Search by example -->
         <div id="page-search" class="page hidden">
         <section class="card" aria-label="Search by example">
@@ -305,6 +355,27 @@
         </div>
     </div>
 
-    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=5"></script>
+    <!-- Photo tag viewer (wall) -->
+    <div id="photo-viewer" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Photo with face tags">
+        <div class="card pviewer">
+            <div class="viewer-head">
+                <span id="pv-title" class="mono muted small"></span>
+                <button id="pv-close" class="icon-btn" aria-label="Close viewer">✕</button>
+            </div>
+            <div id="pv-stage" class="viewer-stage pv-stage">
+                <button id="pv-prev" class="nav-btn" aria-label="Previous photo">‹</button>
+                <div id="pv-frame" class="pv-frame">
+                    <img id="pv-img" alt="Photo">
+                </div>
+                <div id="pv-pop" class="pv-pop hidden" aria-label="Name this face"></div>
+                <button id="pv-next" class="nav-btn" aria-label="Next photo">›</button>
+                <div id="pv-loading" class="pv-loading hidden"><span class="spinner"></span></div>
+            </div>
+            <div id="pv-counter" class="muted small viewer-counter"></div>
+            <div id="pv-meta" class="viewer-meta"></div>
+        </div>
+    </div>
+
+    <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=6"></script>
 </body>
 </html>

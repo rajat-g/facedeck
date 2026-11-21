@@ -119,6 +119,8 @@ export async function loadGroups() {
     }
     loadStats();
     updateBulkBar();
+    // Photo wall / search listen for this to refresh their grids.
+    document.dispatchEvent(new CustomEvent("groups-refreshed"));
 }
 
 /* Lightweight refresh used while a run streams checkpoints: updates the
