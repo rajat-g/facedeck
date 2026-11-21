@@ -24,7 +24,7 @@ const STACK = {
 
 let pv = null; // active viewer state {path, kind, list, index, tags, duplicateOf, busy}
 const staleGrids = new Set(); // grids whose items may be stale after a face-tag change while the viewer is open
-const tagReqSeqs = new Map(); // latest reloadTagData request id per photo path
+const tagReqSeqs = new Map(); // latest reloadTagData request id per canonical photo
 
 /* ---------- init ---------- */
 
@@ -665,15 +665,27 @@ function hidePvLoading() {
     $("#pv-loading").classList.add("hidden");
 }
 
+/* Canonical identity of a photo path: an alias loaded in a grid resolves to
+   its canonical path via the grids' dup_of flags; otherwise the path itself.
+   Requests through the canonical path and any alias share this identity. */
+function canonicalPhotoPath(path) {
+    for (const w of [STACK.photos, STACK.find]) {
+        const item = w.items.find((i) => i.path === path);
+        if (item?.dup_of) return item.dup_of;
+    }
+    return path;
+}
+
 async function reloadTagData(path) {
     if (!pv) { hidePvLoading(); return; }
     path = path || pv.path;
-    const seq = (tagReqSeqs.get(path) || 0) + 1;
-    tagReqSeqs.set(path, seq);
+    const key = canonicalPhotoPath(path); // resolve aliases before reading the sequence
+    const seq = (tagReqSeqs.get(key) || 0) + 1;
+    tagReqSeqs.set(key, seq);
     try {
         const data = await api(`/api/photos/tags?path=${encodeURIComponent(path)}`);
         const tags = data.tags || [];
-        if (tagReqSeqs.get(path) !== seq) return; // a newer request for this photo won
+        if (tagReqSeqs.get(key) !== seq) return; // a newer request for this photo won
         const changed = updateTileChips(data.duplicate_of || path, tags, path);
         if (!pv || pv.path !== path || !photoViewerIsOpen()) {
             // The viewer moved on: the newer load owns the spinner — don't hide it.
@@ -692,7 +704,7 @@ async function reloadTagData(path) {
         renderBoxes();
         renderViewerMeta();
     } catch (err) {
-        if (tagReqSeqs.get(path) === seq) {
+        if (tagReqSeqs.get(key) === seq) {
             hidePvLoading();
             toastError(err.message);
         }
