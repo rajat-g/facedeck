@@ -23,6 +23,8 @@ const STACK = {
 };
 
 let pv = null; // active viewer state {path, kind, list, index, tags, duplicateOf, busy}
+let gridRefreshPending = false; // face-tag change made grids stale while the viewer is open
+const tagReqSeqs = new Map(); // latest reloadTagData request id per photo path
 
 /* ---------- init ---------- */
 
@@ -239,15 +241,35 @@ function appendTiles(w, items) {
     w.grid.appendChild(frag);
 }
 
-/* One tagging changed this photo → rebuild its chips in both grids. */
-function updateTileChips(path, tags) {
+/* One tagging changed this photo → rebuild chips in both grids. The returned
+   tags go to the canonical tile (dup target), the tagged alias, and every
+   loaded alias whose dup_of points at that canonical path. Returns whether
+   any loaded item or tile was updated. */
+function updateTileChips(canonical, tags, alias) {
     const itemView = tagsToItem(tags);
+    const targets = new Set([canonical]);
+    if (alias) targets.add(alias);
     for (const w of [STACK.photos, STACK.find]) {
-        const idx = w.items.findIndex((i) => i.path === path);
-        if (idx >= 0) w.items[idx] = { ...w.items[idx], ...itemView };
-        const tile = w.tiles.get(path);
-        if (tile) paintTileOverlays(tile, w.items[idx] || itemView);
+        for (const i of w.items) {
+            if (i.dup_of === canonical) targets.add(i.path);
+        }
     }
+    let changed = false;
+    for (const w of [STACK.photos, STACK.find]) {
+        for (const target of targets) {
+            const idx = w.items.findIndex((i) => i.path === target);
+            if (idx >= 0) {
+                w.items[idx] = { ...w.items[idx], ...itemView };
+                changed = true;
+            }
+            const tile = w.tiles.get(target);
+            if (tile) {
+                paintTileOverlays(tile, w.items[idx] || itemView);
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 function tagsToItem(tags) {
@@ -284,6 +306,14 @@ export function closePhotoViewer() {
     $("#photo-viewer").classList.add("hidden");
     closePopover();
     pv = null;
+    if (gridRefreshPending) {
+        // The viewer no longer depends on the grids' items: refresh what's
+        // visible, then clear the pending state so unchanged grids are not
+        // reloaded again later.
+        gridRefreshPending = false;
+        resetIfVisible("photos");
+        resetIfVisible("find");
+    }
 }
 
 function openViewer(w, path) {
@@ -318,6 +348,7 @@ function preload(path) {
 
 async function loadPhoto(path) {
     if (!pv) return;
+    const viewer = pv; // discard the reply if this viewer is closed or superseded
     pv.busy = true;
     pv.path = path;
     $("#pv-title").textContent = basename(path);
@@ -342,7 +373,7 @@ async function loadPhoto(path) {
     } catch (err) {
         toastError(err.message);
     }
-    if (!pv || pv.path !== path || !photoViewerIsOpen()) return; // moved on meanwhile
+    if (viewer !== pv || viewer.path !== path || !photoViewerIsOpen()) return; // moved on meanwhile
     hidePvLoading(); // this load owns the spinner; fetch failed or finished
     pv.tags = tags;
     pv.duplicateOf = duplicateOf;
@@ -621,19 +652,28 @@ function hidePvLoading() {
 async function reloadTagData(path) {
     if (!pv) { hidePvLoading(); return; }
     path = path || pv.path;
+    const seq = (tagReqSeqs.get(path) || 0) + 1;
+    tagReqSeqs.set(path, seq);
     try {
         const data = await api(`/api/photos/tags?path=${encodeURIComponent(path)}`);
         const tags = data.tags || [];
-        updateTileChips(path, tags);
-        if (!pv || pv.path !== path || !photoViewerIsOpen()) { hidePvLoading(); return; }
+        if (tagReqSeqs.get(path) !== seq) return; // a newer request for this photo won
+        const changed = updateTileChips(data.duplicate_of || path, tags, path);
+        if (!pv || pv.path !== path || !photoViewerIsOpen()) {
+            // The viewer moved on: the newer load owns the spinner — don't hide it.
+            return;
+        }
         pv.tags = tags;
         pv.duplicateOf = data.duplicate_of || pv.duplicateOf;
+        if (changed) gridRefreshPending = true; // face-tag change while viewer open → refresh on close
         hidePvLoading();
         renderBoxes();
         renderViewerMeta();
     } catch (err) {
-        hidePvLoading();
-        toastError(err.message);
+        if (tagReqSeqs.get(path) === seq) {
+            hidePvLoading();
+            toastError(err.message);
+        }
     }
 }
 
